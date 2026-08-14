@@ -13,12 +13,18 @@ class ScoreEngine:
     """
 
     def calculate_scientific_traction(self, pubmed_matches: List[Dict[str, Any]]) -> float:
-        """Calcula a Tração Científica (0 a 10) baseada em artigos validados."""
-        total_articles = len(pubmed_matches)
-        if total_articles == 0:
+        """
+        Calcula a Tração Científica (0 a 10) ponderando apenas artigos com
+        Entity Resolution bem-sucedida (entity_match), pesados pela confiança
+        do match — evita que artigos não resolvidos (ruído) contem igual a
+        artigos de match confirmado, e produz variação real entre ativos.
+        """
+        resolved = [m for m in pubmed_matches if isinstance(m, dict) and m.get("entity_match")]
+        if not resolved:
             return 0.0
 
-        score = min(10.0, total_articles * 2.0)
+        weighted_sum = sum(m["entity_match"].get("confidence_score", 0.5) for m in resolved)
+        score = min(10.0, weighted_sum * 2.2)
         return round(score, 1)
 
     def calculate_industrial_traction(self, patent_matches: List[Dict[str, Any]]) -> float:

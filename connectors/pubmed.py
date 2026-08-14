@@ -1,6 +1,8 @@
 import sys
+import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any
@@ -15,27 +17,44 @@ class PubMedConnector:
     """
 
     BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    MIN_REQUEST_INTERVAL = 0.4  # NCBI sem API key: limite de ~3 requisições/segundo
+    MAX_RETRIES = 3
 
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
+        self._last_request_at = 0.0
+
+    def _throttled_request(self, url: str) -> bytes:
+        """Faz a requisição respeitando o rate limit do NCBI, com retry/backoff em 429."""
+        for attempt in range(self.MAX_RETRIES):
+            elapsed = time.monotonic() - self._last_request_at
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                time.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+
+            req = urllib.request.Request(url, headers={'User-Agent': 'VanguardData/1.0'})
+            try:
+                with urllib.request.urlopen(req) as response:
+                    self._last_request_at = time.monotonic()
+                    return response.read()
+            except urllib.error.HTTPError as e:
+                self._last_request_at = time.monotonic()
+                if e.code == 429 and attempt < self.MAX_RETRIES - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+
+        raise RuntimeError(f"Falha ao acessar {url} após {self.MAX_RETRIES} tentativas")
 
     def search_articles(self, query: str, max_results: int = 5) -> List[str]:
         """Busca IDs de artigos (PMIDs) no PubMed para um termo específico."""
         url = f"{self.BASE_URL}/esearch.fcgi?db=pubmed&term={urllib.parse.quote(query)}&retmode=json&retmax={max_results}"
-
-        req = urllib.request.Request(url, headers={'User-Agent': 'VanguardData/1.0'})
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
-
+        data = json.loads(self._throttled_request(url).decode())
         return data.get("esearchresult", {}).get("idlist", [])
 
     def fetch_article_details(self, pmid: str) -> Dict[str, Any]:
         """Busca os detalhes (título, resumo, data) de um PMID específico."""
         url = f"{self.BASE_URL}/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
-
-        req = urllib.request.Request(url, headers={'User-Agent': 'VanguardData/1.0'})
-        with urllib.request.urlopen(req) as response:
-            xml_data = response.read()
+        xml_data = self._throttled_request(url)
 
         root = ET.fromstring(xml_data)
         article = root.find(".//Article")

@@ -1,6 +1,7 @@
 import sys
 import io
 import json
+import re
 from typing import Dict, Any, List
 
 import truststore
@@ -32,6 +33,40 @@ RECOMMENDATION_SCHEMA = {
     "required": ["inovacao_pd", "compras_procurement"],
     "additionalProperties": False
 }
+
+
+# Aspas retas e tipográficas (curly quotes), chaves e crase - resíduos comuns
+# de JSON mal fechado ou cercas de código markdown na saída do LLM.
+_RESIDUE_PATTERN = re.compile(r'^[\s"\'“”‘’`{}]+|[\s"\'“”‘’`{}]+$')
+
+# Detecta caudas degeneradas de repetição - o modelo entra em loop tentando
+# sinalizar o fim da resposta (ex.: ")}(fim)}(concluído)}(pronto)}(fim.)}(.)")
+# em vez de simplesmente parar. 3+ grupos parentéticos curtos consecutivos
+# não ocorrem em prosa legítima, então tudo a partir do primeiro grupo é corte seguro.
+_DEGENERATE_LOOP_PATTERN = re.compile(r'(\([^()]{0,60}\)\}?){3,}')
+
+
+def _sanitize_text(text: str) -> str:
+    """
+    Sanitização rígida contra resíduos de formatação em saídas de texto do LLM
+    (cercas de código markdown, aspas retas/tipográficas, chaves soltas de JSON
+    mal fechado e caudas degeneradas de repetição) antes de qualquer texto ser
+    enviado ao gerador de relatórios.
+    """
+    if not text:
+        return text
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+    loop_match = _DEGENERATE_LOOP_PATTERN.search(cleaned)
+    if loop_match:
+        cleaned = cleaned[:loop_match.start()]
+
+    cleaned = _RESIDUE_PATTERN.sub('', cleaned)
+    return cleaned.strip()
 
 
 class LLMAnalysisEngine:
@@ -78,13 +113,14 @@ Responda apenas com o resumo, sem introduções ou comentários adicionais."""
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=500,
+                max_tokens=1024,
                 messages=[{"role": "user", "content": prompt}]
             )
         except anthropic.APIStatusError as e:
             return f"[Falha ao sintetizar evidências via LLM: {e.status_code} - {e.message}]"
 
-        return next((b.text for b in response.content if b.type == "text"), "").strip()
+        raw_text = next((b.text for b in response.content if b.type == "text"), "")
+        return _sanitize_text(raw_text)
 
     def generate_recommendations(
         self,
@@ -108,33 +144,44 @@ Risco de Oferta: {assessment.get('risco_oferta')}
 Confiança do Sinal: {assessment.get('confianca_sinal')}
 Órgão regulatório de referência para este relatório: {regulatory_body}
 
-Com base nessas métricas, gere duas recomendações curtas e acionáveis (2-3 frases cada), no idioma "{lang}", considerando o contexto regulatório de {regulatory_body}:
+Com base nessas métricas, gere duas recomendações curtas e acionáveis (2-3 frases cada), no idioma "{lang}", considerando o contexto regulatório de {regulatory_body}.
 
 1. Uma recomendação para o time de Inovação & P&D.
-2. Uma recomendação para o time de Compras & Procurement."""
+2. Uma recomendação para o time de Compras & Procurement.
 
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                output_config={"format": {"type": "json_schema", "schema": RECOMMENDATION_SCHEMA}},
-                messages=[{"role": "user", "content": prompt}]
-            )
-        except anthropic.APIStatusError as e:
-            error_msg = f"[Falha ao gerar recomendação via LLM: {e.status_code} - {e.message}]"
-            return {"inovacao_pd": error_msg, "compras_procurement": error_msg}
+Responda apenas com o conteúdo das duas recomendações. Não inclua comentários sobre o processo de geração, marcadores de conclusão (ex.: "fim", "concluído", "pronto") ou qualquer texto após a última recomendação — pare assim que o conteúdo estiver completo."""
 
-        raw_text = next(b.text for b in response.content if b.type == "text")
+        last_error_msg = "[Falha ao gerar recomendação via LLM]"
+        for attempt in range(2):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    output_config={"format": {"type": "json_schema", "schema": RECOMMENDATION_SCHEMA}},
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            except anthropic.APIStatusError as e:
+                last_error_msg = f"[Falha ao gerar recomendação via LLM: {e.status_code} - {e.message}]"
+                continue
 
-        if response.stop_reason == "max_tokens":
-            error_msg = "[Resposta do LLM truncada por limite de tokens - recomendação indisponível]"
-            return {"inovacao_pd": error_msg, "compras_procurement": error_msg}
+            raw_text = next(b.text for b in response.content if b.type == "text")
 
-        try:
-            return json.loads(raw_text)
-        except json.JSONDecodeError:
-            error_msg = "[Falha ao interpretar resposta estruturada do LLM]"
-            return {"inovacao_pd": error_msg, "compras_procurement": error_msg}
+            if response.stop_reason == "max_tokens":
+                last_error_msg = "[Resposta do LLM truncada por limite de tokens - recomendação indisponível]"
+                continue
+
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                last_error_msg = "[Falha ao interpretar resposta estruturada do LLM]"
+                continue
+
+            return {
+                "inovacao_pd": _sanitize_text(parsed.get("inovacao_pd", "")),
+                "compras_procurement": _sanitize_text(parsed.get("compras_procurement", ""))
+            }
+
+        return {"inovacao_pd": last_error_msg, "compras_procurement": last_error_msg}
 
 
 if __name__ == "__main__":

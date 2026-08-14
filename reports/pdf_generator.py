@@ -6,19 +6,34 @@ from typing import Dict, Any, List
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
+# Paleta oficial - Verde Florestal & Amarelo Dourado (nenhum tom de azul permitido)
+COLOR_FOREST_GREEN = "#1B4D3E"
+COLOR_GOLD = "#D4AF37"
+COLOR_GOLD_MUTED = "#C5A059"
+COLOR_GOLD_PALE = "#FFF9E6"
+COLOR_SOFT_RED = "#C0392B"
+
+PREDICTIVE_CATEGORY_CLASS = {
+    "Emerging Stars": "cat-emerging",
+    "High-Risk / Supply Alert": "cat-highrisk",
+    "Disruptive Dark Horses": "cat-darkhorse",
+}
+
 
 class PDFReportGenerator:
     """
     Gerador de Relatórios Executivos para a Vanguard Data.
     Gera relatórios nos formatos HTML e PDF nos idiomas PT-BR, PT-PT e ES.
+    Identidade visual: Verde Florestal (#1B4D3E) e Amarelo Dourado (#D4AF37) - sem azul.
     """
 
     TRANSLATIONS = {
         "PT-BR": {
             "title": "RELATÓRIO EXECUTIVO DE INTELIGÊNCIA DE ATIVOS",
-            "subtitle": "Vanguard Data - Análise Multidimensional",
+            "subtitle": "Vanguard Data - Ranking Preditivo de 8 Ativos",
             "asset_id": "ID do Ativo",
             "canonical_name": "Nome Canônico",
+            "predictive_category": "Categoria Preditiva",
             "sci_traction": "Tração Científica",
             "ind_traction": "Tração Industrial",
             "supply_risk": "Risco de Oferta",
@@ -31,9 +46,10 @@ class PDFReportGenerator:
         },
         "PT-PT": {
             "title": "RELATÓRIO EXECUTIVO DE INTELIGÊNCIA DE ATIVOS",
-            "subtitle": "Vanguard Data - Análise Multidimensional",
+            "subtitle": "Vanguard Data - Ranking Preditivo de 8 Ativos",
             "asset_id": "ID do Ativo",
             "canonical_name": "Nome Canónico",
+            "predictive_category": "Categoria Preditiva",
             "sci_traction": "Tracção Científica",
             "ind_traction": "Tracção Industrial",
             "supply_risk": "Risco de Oferta",
@@ -46,9 +62,10 @@ class PDFReportGenerator:
         },
         "ES": {
             "title": "INFORME EJECUTIVO DE INTELIGENCIA DE ACTIVOS",
-            "subtitle": "Vanguard Data - Análisis Multidimensional",
+            "subtitle": "Vanguard Data - Ranking Predictivo de 8 Activos",
             "asset_id": "ID del Activo",
             "canonical_name": "Nombre Canónico",
+            "predictive_category": "Categoría Predictiva",
             "sci_traction": "Tracción Científica",
             "ind_traction": "Tracción Industrial",
             "supply_risk": "Riesgo de Oferta",
@@ -71,10 +88,13 @@ class PDFReportGenerator:
 
         rows_html = ""
         for item in evaluations:
+            category = item.get("predictive_category", "")
+            category_class = PREDICTIVE_CATEGORY_CLASS.get(category, "cat-emerging")
             rows_html += f"""
             <tr>
                 <td><strong>{item['asset_id']}</strong></td>
                 <td>{item['canonical_name']}</td>
+                <td style="text-align: center;"><span class="badge {category_class}">{category}</span></td>
                 <td style="text-align: center;">{item['scientific_traction']}</td>
                 <td style="text-align: center;">{item['industrial_traction']}</td>
                 <td style="text-align: center;"><span class="badge {item['supply_risk'].lower().replace(' ', '-')}">{item['supply_risk']}</span></td>
@@ -114,12 +134,12 @@ class PDFReportGenerator:
             background-color: #ffffff;
         }}
         .header {{
-            border-bottom: 3px solid #1a365d;
+            border-bottom: 3px solid {COLOR_FOREST_GREEN};
             padding-bottom: 12px;
             margin-bottom: 25px;
         }}
         .header h1 {{
-            color: #1a365d;
+            color: {COLOR_FOREST_GREEN};
             font-size: 16pt;
             margin: 0 0 6px 0;
             text-transform: uppercase;
@@ -136,7 +156,7 @@ class PDFReportGenerator:
             margin-top: 15px;
         }}
         th {{
-            background-color: #2b6cb0;
+            background-color: {COLOR_FOREST_GREEN};
             color: #ffffff;
             font-size: 8.5pt;
             text-transform: uppercase;
@@ -158,13 +178,16 @@ class PDFReportGenerator:
             font-weight: bold;
         }}
         .baixo-risco {{ background-color: #c6f6d5; color: #22543d; }}
-        .medio-risco {{ background-color: #feebc8; color: #744210; }}
-        .alto-risco {{ background-color: #fed7d7; color: #742a2a; }}
-        .conf-alta {{ color: #2b6cb0; font-weight: bold; }}
-        .conf-média, .conf-media {{ color: #d69e2e; font-weight: bold; }}
-        .conf-baixa {{ color: #e53e3e; font-weight: bold; }}
+        .medio-risco {{ background-color: {COLOR_GOLD_PALE}; color: #7a5c00; }}
+        .alto-risco {{ background-color: {COLOR_GOLD}; color: #4a3800; }}
+        .conf-alta {{ color: {COLOR_FOREST_GREEN}; font-weight: bold; }}
+        .conf-média, .conf-media {{ color: #a8791a; font-weight: bold; }}
+        .conf-baixa {{ color: {COLOR_SOFT_RED}; font-weight: bold; }}
+        .cat-emerging {{ background-color: {COLOR_FOREST_GREEN}; color: #ffffff; }}
+        .cat-highrisk {{ background-color: {COLOR_GOLD}; color: #4a3800; }}
+        .cat-darkhorse {{ background-color: {COLOR_GOLD_PALE}; color: #7a5c00; border: 1px solid {COLOR_GOLD_MUTED}; }}
         .section-title {{
-            color: #1a365d;
+            color: {COLOR_FOREST_GREEN};
             font-size: 12pt;
             margin: 30px 0 4px 0;
             text-transform: uppercase;
@@ -173,11 +196,11 @@ class PDFReportGenerator:
             table-layout: fixed;
         }}
         table.recommendations th.header-pd {{
-            background-color: #1b4d3e;
+            background-color: {COLOR_FOREST_GREEN};
             color: #ffffff;
         }}
         table.recommendations th.header-procurement {{
-            background-color: #b38646;
+            background-color: {COLOR_GOLD_MUTED};
             color: #ffffff;
         }}
         table.recommendations td {{
@@ -186,10 +209,10 @@ class PDFReportGenerator:
             font-size: 8.5pt;
         }}
         table.recommendations tr:nth-child(even) td {{
-            background-color: #f7fafc;
+            background-color: {COLOR_GOLD_PALE};
         }}
         table.recommendations td.col-ativo {{
-            background-color: #1b4d3e !important;
+            background-color: {COLOR_FOREST_GREEN} !important;
             color: #ffffff !important;
             font-weight: bold;
             width: 18%;
@@ -214,6 +237,7 @@ class PDFReportGenerator:
             <tr>
                 <th>{t['asset_id']}</th>
                 <th>{t['canonical_name']}</th>
+                <th style="text-align: center;">{t['predictive_category']}</th>
                 <th style="text-align: center;">{t['sci_traction']}</th>
                 <th style="text-align: center;">{t['ind_traction']}</th>
                 <th style="text-align: center;">{t['supply_risk']}</th>
@@ -281,16 +305,25 @@ if __name__ == "__main__":
     generator = PDFReportGenerator()
     mock_evals = [
         {
-            "asset_id": "AT-001", "canonical_name": "Bakuchiol", "scientific_traction": "4.0/10",
-            "industrial_traction": "4.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "ALTA",
+            "asset_id": "AT-001", "canonical_name": "Bakuchiol", "predictive_category": "Emerging Stars",
+            "scientific_traction": "6.3/10", "industrial_traction": "6.0/10",
+            "supply_risk": "BAIXO RISCO", "confidence_level": "ALTA",
             "inovacao_pd": "Investir em estudos de estabilidade e eficácia comparativa frente ao retinol.",
             "compras_procurement": "Negociar contratos de médio prazo com fornecedores já qualificados."
         },
         {
-            "asset_id": "AT-002", "canonical_name": "Centella Asiática", "scientific_traction": "4.0/10",
-            "industrial_traction": "0.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "BAIXA",
-            "inovacao_pd": "Ampliar coleta de evidências científicas antes de priorizar novas formulações.",
-            "compras_procurement": "Manter fornecedor atual; volume de compra ainda não justifica diversificação."
+            "asset_id": "AT-019", "canonical_name": "Alcaçuz", "predictive_category": "High-Risk / Supply Alert",
+            "scientific_traction": "4.4/10", "industrial_traction": "0.0/10",
+            "supply_risk": "ALTO RISCO", "confidence_level": "MÉDIA",
+            "inovacao_pd": "Avaliar alternativas de padronização para reduzir dependência regulatória.",
+            "compras_procurement": "Qualificar fornecedores adicionais para mitigar risco de escassez."
+        },
+        {
+            "asset_id": "AT-005", "canonical_name": "Bidens Pilosa", "predictive_category": "Disruptive Dark Horses",
+            "scientific_traction": "2.1/10", "industrial_traction": "0.0/10",
+            "supply_risk": "BAIXO RISCO", "confidence_level": "BAIXA",
+            "inovacao_pd": "Monitorar literatura emergente antes de comprometer recursos de P&D.",
+            "compras_procurement": "Sem ação de compras necessária neste estágio de maturidade."
         }
     ]
     generator.export_all_languages(mock_evals)
