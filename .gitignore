@@ -20,6 +20,9 @@ ENV/
 *.sqlite
 *.sqlite3
 
+# Generated reports (build artifacts, not source)
+reports/output/
+
 # Distribution / packaging
 build/
 dist/
