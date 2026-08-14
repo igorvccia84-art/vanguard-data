@@ -1,0 +1,43 @@
+# Bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code local settings (machine-specific, not shared)
+.claude/settings.local.json
+
+# Coverage
+.coverage
+htmlcov/

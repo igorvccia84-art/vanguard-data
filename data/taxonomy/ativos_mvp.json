@@ -1,0 +1,64 @@
+[
+  {
+    "asset_id": "AT-001",
+    "canonical_name": "Bakuchiol",
+    "inci_name": "Bakuchiol",
+    "cas_number": "10309-37-2",
+    "botanical_name": "Psoralea corylifolia",
+    "aliases": [
+      "bakuchiol",
+      "bakuchiol extract",
+      "psoralea corylifolia seed extract",
+      "drupanin derivative"
+    ],
+    "ipc_codes": [
+      "A61K8/97",
+      "A61K31/05",
+      "A61P17/00"
+    ],
+    "hs_codes": [
+      "1302.19.99"
+    ]
+  },
+  {
+    "asset_id": "AT-002",
+    "canonical_name": "Ácido Ferúlico",
+    "inci_name": "Ferulic Acid",
+    "cas_number": "1135-24-6",
+    "botanical_name": "Ferula foetida",
+    "aliases": [
+      "ferulic acid",
+      "acido ferulico",
+      "4-hydroxy-3-methoxycinnamic acid",
+      "natural ferulic acid"
+    ],
+    "ipc_codes": [
+      "A61K8/368",
+      "C07C59/68"
+    ],
+    "hs_codes": [
+      "2918.99.90"
+    ]
+  },
+  {
+    "asset_id": "AT-003",
+    "canonical_name": "Niacinamida",
+    "inci_name": "Niacinamide",
+    "cas_number": "98-92-0",
+    "botanical_name": null,
+    "aliases": [
+      "niacinamide",
+      "nicotinamide",
+      "vitamin b3",
+      "vitamina b3",
+      "3-pyridinecarboxamide"
+    ],
+    "ipc_codes": [
+      "A61K8/67",
+      "C07D213/82"
+    ],
+    "hs_codes": [
+      "2936.29.11"
+    ]
+  }
+]
