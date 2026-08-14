@@ -10,7 +10,10 @@ from connectors.patents import PatentConnector
 from connectors.regulatory_comex import RegulatoryComexConnector
 from core.score_engine import ScoreEngine
 from core.database import DatabaseManager
+from core.llm_analysis import LLMAnalysisEngine
 from reports.pdf_generator import PDFReportGenerator
+
+LANGUAGES = ["PT-BR", "PT-PT", "ES"]
 
 
 def main():
@@ -24,16 +27,17 @@ def main():
     assets = resolver.assets
     print(f"\n[1] Taxonomia carregada: {len(assets)} ativo(s) configurado(s).")
 
-    # 2. Inicializar Conectores, Engine de Score, Banco e Relatórios
+    # 2. Inicializar Conectores, Engine de Score, Banco, LLM e Relatórios
     pubmed_conn = PubMedConnector(resolver=resolver)
     patent_conn = PatentConnector(resolver=resolver)
     comex_conn = RegulatoryComexConnector(resolver=resolver)
 
     score_engine = ScoreEngine()
     db_manager = DatabaseManager()
+    llm_engine = LLMAnalysisEngine()
     pdf_generator = PDFReportGenerator()
 
-    evaluations_for_report = []
+    evaluations_by_lang = {lang: [] for lang in LANGUAGES}
 
     # 3. Processar cada Ativo
     for asset in assets:
@@ -77,21 +81,30 @@ def main():
         db_manager.save_evaluation(asset_id, canonical_name, assessment)
         print("   💾 Avaliação salva no banco de dados com sucesso.")
 
-        # Estrutura para os relatórios
-        evaluations_for_report.append({
-            "asset_id": asset_id,
-            "canonical_name": canonical_name,
-            "scientific_traction": assessment["tracao_cientifica"],
-            "industrial_traction": assessment["tracao_industrial"],
-            "supply_risk": assessment["risco_oferta"],
-            "confidence_level": assessment["confianca_sinal"]
-        })
+        # Síntese via LLM (Claude Sonnet 5): resumo de evidências + recomendações por idioma
+        evidence_summary = llm_engine.summarize_evidence(canonical_name, pubmed_results, patent_results)
+        print(f"   🤖 Resumo LLM: {evidence_summary[:90]}...")
 
-    # 4. Gerar Relatórios Executivos em PDF
+        for lang in LANGUAGES:
+            recs = llm_engine.generate_recommendations(canonical_name, assessment, lang=lang)
+            evaluations_by_lang[lang].append({
+                "asset_id": asset_id,
+                "canonical_name": canonical_name,
+                "scientific_traction": assessment["tracao_cientifica"],
+                "industrial_traction": assessment["tracao_industrial"],
+                "supply_risk": assessment["risco_oferta"],
+                "confidence_level": assessment["confianca_sinal"],
+                "inovacao_pd": recs["inovacao_pd"],
+                "compras_procurement": recs["compras_procurement"]
+            })
+        print(f"   🤖 Recomendações geradas para {len(LANGUAGES)} idiomas.")
+
+    # 4. Gerar Relatórios Executivos em PDF (recomendações localizadas por idioma)
     print("\n" + "=" * 70)
     print("📄 GERANDO RELATÓRIOS EXECUTIVOS EM PDF (PT-BR, PT-PT, ES)")
     print("=" * 70)
-    pdf_generator.export_all_languages(evaluations_for_report)
+    for lang in LANGUAGES:
+        pdf_generator.generate_report(evaluations_by_lang[lang], lang=lang)
 
     print("\n✅ Execução do Pipeline Concluída com Sucesso!")
 

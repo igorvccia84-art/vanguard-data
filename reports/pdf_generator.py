@@ -23,6 +23,10 @@ class PDFReportGenerator:
             "ind_traction": "Tração Industrial",
             "supply_risk": "Risco de Oferta",
             "confidence": "Confiança do Sinal",
+            "recommendations_title": "Recomendações Estratégicas (Síntese via IA)",
+            "col_asset": "Ativo",
+            "col_rd": "Inovação & P&D",
+            "col_procurement": "Compras & Procurement",
             "footer": "Relatório gerado automaticamente pela Plataforma Vanguard Data (Brasil)"
         },
         "PT-PT": {
@@ -34,6 +38,10 @@ class PDFReportGenerator:
             "ind_traction": "Tracção Industrial",
             "supply_risk": "Risco de Oferta",
             "confidence": "Confiança do Sinal",
+            "recommendations_title": "Recomendações Estratégicas (Síntese via IA)",
+            "col_asset": "Ativo",
+            "col_rd": "Inovação & I&D",
+            "col_procurement": "Compras & Procurement",
             "footer": "Relatório gerado automaticamente pela Plataforma Vanguard Data (Portugal)"
         },
         "ES": {
@@ -45,6 +53,10 @@ class PDFReportGenerator:
             "ind_traction": "Tracción Industrial",
             "supply_risk": "Riesgo de Oferta",
             "confidence": "Confianza de la Señal",
+            "recommendations_title": "Recomendaciones Estratégicas (Síntesis vía IA)",
+            "col_asset": "Activo",
+            "col_rd": "Innovación & I+D",
+            "col_procurement": "Compras & Procurement",
             "footer": "Informe generado automáticamente por la Plataforma Vanguard Data"
         }
     }
@@ -67,6 +79,20 @@ class PDFReportGenerator:
                 <td style="text-align: center;">{item['industrial_traction']}</td>
                 <td style="text-align: center;"><span class="badge {item['supply_risk'].lower().replace(' ', '-')}">{item['supply_risk']}</span></td>
                 <td style="text-align: center;"><span class="badge conf-{item['confidence_level'].lower()}">{item['confidence_level']}</span></td>
+            </tr>
+            """
+
+        recommendation_rows_html = ""
+        for item in evaluations:
+            inovacao_pd = item.get("inovacao_pd")
+            compras_procurement = item.get("compras_procurement")
+            if not inovacao_pd and not compras_procurement:
+                continue
+            recommendation_rows_html += f"""
+            <tr>
+                <td class="col-ativo">{item['canonical_name']}</td>
+                <td>{inovacao_pd or '—'}</td>
+                <td>{compras_procurement or '—'}</td>
             </tr>
             """
 
@@ -137,6 +163,37 @@ class PDFReportGenerator:
         .conf-alta {{ color: #2b6cb0; font-weight: bold; }}
         .conf-média, .conf-media {{ color: #d69e2e; font-weight: bold; }}
         .conf-baixa {{ color: #e53e3e; font-weight: bold; }}
+        .section-title {{
+            color: #1a365d;
+            font-size: 12pt;
+            margin: 30px 0 4px 0;
+            text-transform: uppercase;
+        }}
+        table.recommendations {{
+            table-layout: fixed;
+        }}
+        table.recommendations th.header-pd {{
+            background-color: #1b4d3e;
+            color: #ffffff;
+        }}
+        table.recommendations th.header-procurement {{
+            background-color: #b38646;
+            color: #ffffff;
+        }}
+        table.recommendations td {{
+            vertical-align: top;
+            line-height: 1.4;
+            font-size: 8.5pt;
+        }}
+        table.recommendations tr:nth-child(even) td {{
+            background-color: #f7fafc;
+        }}
+        table.recommendations td.col-ativo {{
+            background-color: #1b4d3e !important;
+            color: #ffffff !important;
+            font-weight: bold;
+            width: 18%;
+        }}
         .footer {{
             margin-top: 30px;
             border-top: 1px solid #e2e8f0;
@@ -167,6 +224,19 @@ class PDFReportGenerator:
             {rows_html}
         </tbody>
     </table>
+    {f'''<h3 class="section-title">{t['recommendations_title']}</h3>
+    <table class="recommendations">
+        <thead>
+            <tr>
+                <th>{t['col_asset']}</th>
+                <th class="header-pd">{t['col_rd']}</th>
+                <th class="header-procurement">{t['col_procurement']}</th>
+            </tr>
+        </thead>
+        <tbody>
+            {recommendation_rows_html}
+        </tbody>
+    </table>''' if recommendation_rows_html else ''}
     <div class="footer">
         {t['footer']}
     </div>
@@ -210,8 +280,17 @@ class PDFReportGenerator:
 if __name__ == "__main__":
     generator = PDFReportGenerator()
     mock_evals = [
-        {"asset_id": "AT-001", "canonical_name": "Bakuchiol", "scientific_traction": "4.0/10", "industrial_traction": "4.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "ALTA"},
-        {"asset_id": "AT-002", "canonical_name": "Ácido Ferúlico", "scientific_traction": "4.0/10", "industrial_traction": "0.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "BAIXA"},
-        {"asset_id": "AT-003", "canonical_name": "Niacinamida", "scientific_traction": "4.0/10", "industrial_traction": "0.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "MÉDIA"}
+        {
+            "asset_id": "AT-001", "canonical_name": "Bakuchiol", "scientific_traction": "4.0/10",
+            "industrial_traction": "4.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "ALTA",
+            "inovacao_pd": "Investir em estudos de estabilidade e eficácia comparativa frente ao retinol.",
+            "compras_procurement": "Negociar contratos de médio prazo com fornecedores já qualificados."
+        },
+        {
+            "asset_id": "AT-002", "canonical_name": "Centella Asiática", "scientific_traction": "4.0/10",
+            "industrial_traction": "0.0/10", "supply_risk": "BAIXO RISCO", "confidence_level": "BAIXA",
+            "inovacao_pd": "Ampliar coleta de evidências científicas antes de priorizar novas formulações.",
+            "compras_procurement": "Manter fornecedor atual; volume de compra ainda não justifica diversificação."
+        }
     ]
     generator.export_all_languages(mock_evals)
