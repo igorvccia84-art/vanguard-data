@@ -1,15 +1,23 @@
 import sys
 import io
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+MODEL_VERSION = "2.0.0"
 
 
 class ScoreEngine:
     """
     Motor de Cálculo de Score Decomposto da Vanguard Data.
     Substitui a caixa-preta por 3 pilares transparentes e auditáveis.
+
+    Consome o dossiê refatorado do RegulatoryComexConnector
+    (connectors/regulatory_comex.py), que separa 'alertas_regulatorios'
+    (conformidade/uso permitido) de 'sinais_comerciais_comex' (oferta/
+    importação) - os dois pilares nunca são somados numa métrica opaca única;
+    o Risco de Oferta final expõe qual dos dois o determinou.
     """
 
     def calculate_scientific_traction(self, pubmed_matches: List[Dict[str, Any]]) -> float:
@@ -28,7 +36,7 @@ class ScoreEngine:
         return round(score, 1)
 
     def calculate_industrial_traction(self, patent_matches: List[Dict[str, Any]]) -> float:
-        """Calcula a Tração Industrial (0 a 10) baseada em patentes e inovação."""
+        """Calcula a Tração Industrial (0 a 10) baseada em patentes (já deduplicadas por família) e inovação."""
         total_patents = len(patent_matches)
         if total_patents == 0:
             return 0.0
@@ -39,17 +47,47 @@ class ScoreEngine:
         base_score = min(8.0, total_patents * 3.0)
         return round(min(10.0, base_score + diversity_bonus), 1)
 
-    def calculate_supply_risk(self, reg_data: Dict[str, Any], trade_data: Dict[str, Any]) -> str:
+    def calculate_regulatory_alert_level(self, regulatory_alerts: Dict[str, Any]) -> str:
         """
-        Calcula a classificação de Risco de Oferta baseada em restrições
-        regulatórias e fornecedores do comércio exterior.
+        Classifica isoladamente o Alerta Regulatório (conformidade/uso permitido),
+        a partir de connectors.regulatory_comex.fetch_regulatory_status()
+        (chave 'alertas_regulatorios' do dossiê).
         """
-        restriction = reg_data.get("restriction_level", "BAIXO")
-        suppliers = trade_data.get("suppliers_count", 0)
+        restriction = (regulatory_alerts or {}).get("restriction_level", "DESCONHECIDO")
+        return {
+            "ALTO": "ALERTA ALTO",
+            "MEDIO": "ALERTA MÉDIO",
+            "BAIXO": "ALERTA BAIXO",
+            "NENHUM": "SEM ALERTA",
+        }.get(restriction, "ALERTA DESCONHECIDO")
 
-        if restriction == "ALTO" or suppliers < 2:
+    def calculate_commercial_signal_level(self, commercial_signals: Dict[str, Any]) -> str:
+        """
+        Classifica isoladamente o Sinal Comercial/Comex (oferta/importação),
+        a partir de connectors.regulatory_comex.fetch_import_volume_mock()
+        (chave 'sinais_comerciais_comex' do dossiê) — sem considerar regulação.
+        """
+        suppliers = (commercial_signals or {}).get("suppliers_count", 0)
+        if suppliers < 2:
+            return "OFERTA CRÍTICA"
+        elif suppliers < 5:
+            return "OFERTA LIMITADA"
+        else:
+            return "OFERTA SAUDÁVEL"
+
+    def calculate_supply_risk(self, regulatory_alerts: Dict[str, Any], commercial_signals: Dict[str, Any]) -> str:
+        """
+        Calcula a classificação consolidada de Risco de Oferta a partir dos dois
+        pilares independentes (Alerta Regulatório e Sinal Comercial/Comex),
+        aplicando o pior caso entre os dois. Os dois indicadores continuam
+        disponíveis separadamente no retorno de generate_assessment().
+        """
+        regulatory_level = self.calculate_regulatory_alert_level(regulatory_alerts)
+        commercial_level = self.calculate_commercial_signal_level(commercial_signals)
+
+        if regulatory_level == "ALERTA ALTO" or commercial_level == "OFERTA CRÍTICA":
             return "ALTO RISCO"
-        elif restriction == "MEDIO" or suppliers < 5:
+        elif regulatory_level in ("ALERTA MÉDIO", "ALERTA DESCONHECIDO") or commercial_level == "OFERTA LIMITADA":
             return "MEDIO RISCO"
         else:
             return "BAIXO RISCO"
@@ -79,26 +117,42 @@ class ScoreEngine:
         self,
         pubmed_data: List[Dict[str, Any]],
         patent_data: List[Dict[str, Any]],
-        reg_data: Dict[str, Any] = None,
-        trade_data: Dict[str, Any] = None
+        regulatory_alerts: Dict[str, Any] = None,
+        commercial_signals: Dict[str, Any] = None,
+        query_hashes: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """Gera a avaliação final decomposta do ativo em 3 pilares."""
-        reg_data = reg_data or {}
-        trade_data = trade_data or {}
+        """
+        Gera a avaliação final decomposta do ativo. Consome diretamente o formato
+        refatorado dos conectores: 'regulatory_alerts' (dossier['alertas_regulatorios'])
+        e 'commercial_signals' (dossier['sinais_comerciais_comex']) de
+        RegulatoryComexConnector.get_asset_dossier(). Retorna o dicionário completo
+        de scores, incluindo o model_version desta execução e os query_hashes das
+        evidências coletadas (para auditoria em evaluation_evidence_sources /
+        rastreabilidade no PDF).
+        """
+        regulatory_alerts = regulatory_alerts or {}
+        commercial_signals = commercial_signals or {}
 
         sc_score = self.calculate_scientific_traction(pubmed_data)
         ind_score = self.calculate_industrial_traction(patent_data)
-        supply_risk = self.calculate_supply_risk(reg_data, trade_data)
+
+        regulatory_alert_level = self.calculate_regulatory_alert_level(regulatory_alerts)
+        commercial_signal_level = self.calculate_commercial_signal_level(commercial_signals)
+        supply_risk = self.calculate_supply_risk(regulatory_alerts, commercial_signals)
 
         all_signals = pubmed_data + patent_data
         confidence = self.calculate_confidence_level(all_signals)
 
         return {
+            "model_version": MODEL_VERSION,
             "tracao_cientifica": f"{sc_score}/10",
             "tracao_industrial": f"{ind_score}/10",
+            "alerta_regulatorio": regulatory_alert_level,
+            "sinal_comercial_comex": commercial_signal_level,
             "risco_oferta": supply_risk,
             "confianca_sinal": confidence,
-            "total_evidencias": len(all_signals)
+            "total_evidencias": len(all_signals),
+            "query_hashes": query_hashes or []
         }
 
 
@@ -107,14 +161,21 @@ if __name__ == "__main__":
 
     mock_pubmed = [{"entity_match": {"confidence_score": 0.95}}, {"entity_match": {"confidence_score": 0.95}}]
     mock_patents = [{"assignee": "Derma Ltd", "entity_match": {"confidence_score": 0.95}}]
-    mock_reg = {"restriction_level": "BAIXO"}
-    mock_trade = {"suppliers_count": 8}
+    mock_regulatory_alerts = {"restriction_level": "BAIXO", "alerts": []}
+    mock_commercial_signals = {"suppliers_count": 8, "trend": "CRESCENTE"}
+    mock_query_hashes = ["9c4a63a04bee3dbaff001145eb35bb6352592580d0592d02f96489b77a013b8", "53f1e4ad83e6db511b620ca438e81b495c9ac6a7abb97f9cb3cda732982e4eb"]
 
-    avaliacao = engine.generate_assessment(mock_pubmed, mock_patents, mock_reg, mock_trade)
+    avaliacao = engine.generate_assessment(
+        mock_pubmed, mock_patents, mock_regulatory_alerts, mock_commercial_signals, query_hashes=mock_query_hashes
+    )
 
     print("--- Avaliação Decomposta Atualizada ---")
-    print(f"Tração Científica: {avaliacao['tracao_cientifica']}")
-    print(f"Tração Industrial: {avaliacao['tracao_industrial']}")
-    print(f"Risco de Oferta:    {avaliacao['risco_oferta']}")
-    print(f"Confiança do Sinal: {avaliacao['confianca_sinal']}")
-    print(f"Total Evidências:   {avaliacao['total_evidencias']}")
+    print(f"Model Version:            {avaliacao['model_version']}")
+    print(f"Tração Científica:        {avaliacao['tracao_cientifica']}")
+    print(f"Tração Industrial:        {avaliacao['tracao_industrial']}")
+    print(f"Alerta Regulatório:       {avaliacao['alerta_regulatorio']}")
+    print(f"Sinal Comercial/Comex:    {avaliacao['sinal_comercial_comex']}")
+    print(f"Risco de Oferta (consol.):{avaliacao['risco_oferta']}")
+    print(f"Confiança do Sinal:       {avaliacao['confianca_sinal']}")
+    print(f"Total Evidências:         {avaliacao['total_evidencias']}")
+    print(f"Query Hashes:             {avaliacao['query_hashes']}")
