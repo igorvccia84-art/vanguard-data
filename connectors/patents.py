@@ -24,7 +24,8 @@ class PatentConnector:
     que o relatório reflita sinais industriais recentes de mercado.
     """
 
-    SEARCH_WINDOW_DAYS = 15
+    SEARCH_WINDOW_DAYS = 15  # janela de novidades exibida no relatório
+    TRACTION_WINDOW_DAYS = 365  # janela histórica móvel usada para calcular Tração Industrial (core/score_engine.py)
 
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
@@ -84,24 +85,28 @@ class PatentConnector:
         """SHA256 da query exata de busca, para rastreabilidade em evaluation_evidence_sources."""
         return hashlib.sha256(query.encode('utf-8')).hexdigest()
 
-    def _search_window(self) -> Tuple[date, date]:
-        """Janela de busca: dos últimos SEARCH_WINDOW_DAYS dias até a data atual (data de publicação da patente)."""
+    def _search_window(self, days: Optional[int] = None) -> Tuple[date, date]:
+        """Janela de busca: dos últimos `days` dias (default SEARCH_WINDOW_DAYS) até a data atual (data de publicação da patente)."""
         end_date = date.today()
-        start_date = end_date - timedelta(days=self.SEARCH_WINDOW_DAYS)
+        start_date = end_date - timedelta(days=days if days is not None else self.SEARCH_WINDOW_DAYS)
         return start_date, end_date
 
-    def fetch_patents_mock(self, query: str, exclusions: Optional[List[str]] = None) -> Dict[str, Any]:
+    def fetch_patents_mock(self, query: str, exclusions: Optional[List[str]] = None, days: Optional[int] = None) -> Dict[str, Any]:
         """
         Busca patentes cujo título contenha a query, restringe à janela dos
-        últimos SEARCH_WINDOW_DAYS dias (publication_date), aplica os termos de
-        exclusão do ativo (remove ruído fora da aplicação tópica/cosmética) e
-        deduplica por família de patentes - mantendo apenas o depósito mais
-        antigo de cada family_id, já que múltiplas jurisdições da mesma
-        invenção não representam sinais industriais independentes. Retorna os
-        resultados deduplicados junto com a query exata, seu hash SHA256, a
-        janela de datas aplicada e as métricas de deduplicação.
+        últimos `days` dias (default SEARCH_WINDOW_DAYS=15, publication_date),
+        aplica os termos de exclusão do ativo (remove ruído fora da aplicação
+        tópica/cosmética) e deduplica por família de patentes - mantendo
+        apenas o depósito mais antigo de cada family_id, já que múltiplas
+        jurisdições da mesma invenção não representam sinais industriais
+        independentes. Passar `days=TRACTION_WINDOW_DAYS` para a janela
+        histórica móvel de 12 meses usada no cálculo de Tração Industrial
+        (core/score_engine.py), mantendo a janela padrão de 15 dias para as
+        novidades exibidas no relatório. Retorna os resultados deduplicados
+        junto com a query exata, seu hash SHA256, a janela de datas aplicada
+        e as métricas de deduplicação.
         """
-        start_date, end_date = self._search_window()
+        start_date, end_date = self._search_window(days=days)
         date_range = {"start": start_date.isoformat(), "end": end_date.isoformat()}
 
         try:

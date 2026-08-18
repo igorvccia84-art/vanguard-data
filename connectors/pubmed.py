@@ -35,7 +35,8 @@ class PubMedConnector:
     MIN_REQUEST_INTERVAL = 0.4  # NCBI sem API key: limite de ~3 requisições/segundo
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 10  # segundos
-    SEARCH_WINDOW_DAYS = 15
+    SEARCH_WINDOW_DAYS = 15  # janela de novidades exibida no relatório
+    TRACTION_WINDOW_DAYS = 365  # janela histórica móvel usada para calcular Tração Científica (core/score_engine.py)
 
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
@@ -83,31 +84,50 @@ class PubMedConnector:
         """SHA256 da query exata enviada ao PubMed, para rastreabilidade em evaluation_evidence_sources."""
         return hashlib.sha256(query.encode('utf-8')).hexdigest()
 
-    def _search_window(self) -> Tuple[date, date]:
-        """Janela de busca: dos últimos SEARCH_WINDOW_DAYS dias até a data atual (data de publicação)."""
-        end_date = date.today()
-        start_date = end_date - timedelta(days=self.SEARCH_WINDOW_DAYS)
+    def _search_window(self, days: Optional[int] = None, end_days_ago: int = 0) -> Tuple[date, date]:
+        """
+        Janela de busca: de `days` dias atrás (default SEARCH_WINDOW_DAYS) até
+        `end_days_ago` dias atrás (default 0 = hoje). `end_days_ago > 0`
+        desloca a janela inteira para o passado, sem sobreposição com o
+        presente - usado para consultas de linha de base histórica (ex.:
+        calculate_scientific_traction's componente [G] em core/score_engine.py,
+        que exige uma janela de 36 meses estritamente anterior aos 12 meses
+        de análise, "sem contaminação do período recente").
+        """
+        today = date.today()
+        end_date = today - timedelta(days=end_days_ago)
+        start_date = today - timedelta(days=days if days is not None else self.SEARCH_WINDOW_DAYS)
         return start_date, end_date
 
     def search_articles(
         self,
         query: str,
         exclusions: Optional[List[str]] = None,
-        max_results: int = 5
+        max_results: int = 5,
+        days: Optional[int] = None,
+        end_days_ago: int = 0
     ) -> Dict[str, Any]:
         """
-        Busca PMIDs no PubMed para um termo específico, restrita à janela dos
-        últimos SEARCH_WINDOW_DAYS dias (data de publicação) e aplicando as
-        exclusões do ativo já na origem (reduz ruído sistêmico/off-topic antes
-        mesmo da Entity Resolution). Retorna PMIDs, contagem total reportada
-        pelo PubMed, o hash SHA256 da query exata, a janela de datas aplicada
-        e um resumo dos metadados brutos da resposta. Resiliente a timeout e
-        falha de rede: em caso de falha, retorna uma resposta vazia e
-        degradada em vez de propagar a exceção.
+        Busca PMIDs no PubMed para um termo específico, restrita à janela de
+        `days` dias atrás (default SEARCH_WINDOW_DAYS=15) até `end_days_ago`
+        dias atrás (default 0 = hoje, data de publicação), e aplicando as
+        exclusões do ativo já na origem (reduz ruído sistêmico/off-topic
+        antes mesmo da Entity Resolution). Passar `days=TRACTION_WINDOW_DAYS`
+        para a janela histórica móvel de 12 meses usada no cálculo de Tração
+        Científica (core/score_engine.py), ou `end_days_ago > 0` para uma
+        janela de linha de base histórica deslocada para o passado (sem
+        sobreposição com o período de análise). `max_results=0` retorna
+        apenas a contagem bruta do PubMed (nenhum PMID, nenhum custo de
+        efetch subsequente) - suficiente para uma comparação de magnitude
+        sem precisar resolver cada artigo individualmente. Retorna PMIDs,
+        contagem total reportada pelo PubMed, o hash SHA256 da query exata,
+        a janela de datas aplicada e um resumo dos metadados brutos da
+        resposta. Resiliente a timeout e falha de rede: em caso de falha,
+        retorna uma resposta vazia e degradada em vez de propagar a exceção.
         """
         full_query = self._build_query(query, exclusions)
         query_hash = self._query_hash(full_query)
-        start_date, end_date = self._search_window()
+        start_date, end_date = self._search_window(days=days, end_days_ago=end_days_ago)
         date_range = {"start": start_date.isoformat(), "end": end_date.isoformat()}
 
         url = (
@@ -147,6 +167,15 @@ class PubMedConnector:
         Busca os detalhes (título, resumo) de um PMID específico e resolve a
         entidade do ativo. Resiliente a timeout/falha de rede: retorna um
         registro degradado (com campo 'error') em vez de derrubar o pipeline.
+
+        Hook de verificação (blindagem contra PMID alucinado/errôneo): o
+        campo 'verified' só é True quando (1) o efetch trouxe um título real
+        para o PMID - confirmando que o registro existe de fato no PubMed - e
+        (2) a Entity Resolution reconheceu o ativo pesquisado no título/resumo
+        do artigo - confirmando que o PMID pertence de fato ao ativo em
+        questão, não apenas a um ID válido para outro assunto. Chamadores
+        (main.py) devem descartar qualquer PMID com verified=False antes de
+        exibi-lo no relatório - nenhum PMID chega ao PDF sem essa confirmação.
         """
         url = f"{self.BASE_URL}/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
 
@@ -158,6 +187,7 @@ class PubMedConnector:
                 "title": "",
                 "source": "PubMed",
                 "entity_match": None,
+                "verified": False,
                 "error": str(e)
             }
 
@@ -173,17 +203,25 @@ class PubMedConnector:
                 "title": "",
                 "source": "PubMed",
                 "entity_match": None,
+                "verified": False,
                 "error": f"Falha ao interpretar XML: {e}"
             }
 
         full_text = f"{title} {abstract}"
-        resolved_entity = self.resolver.resolve(full_text)
+        # require_topical_context=True: reforço de relevância tópica - o artigo
+        # precisa, além de mencionar o ativo, atingir ao menos o Nível 2 de
+        # relevância (core/entity_resolver.py TOPICAL_CONTEXT_TERMS/PRODUCT_FORMULATION_TERMS).
+        # Bloqueia falsos positivos como um estudo de fratura mandibular que
+        # apenas menciona o nome botânico do ativo sem relação com skincare.
+        resolved_entity = self.resolver.resolve(full_text, require_topical_context=True)
+        verified = bool(title) and resolved_entity is not None
 
         return {
             "pmid": pmid,
             "title": title,
             "source": "PubMed",
-            "entity_match": resolved_entity
+            "entity_match": resolved_entity,
+            "verified": verified
         }
 
 
@@ -210,3 +248,12 @@ if __name__ == "__main__":
         print(f"\n[PMID {pmid}]")
         print(f"Título: {details['title'][:80]}...")
         print(f"Entidade Resolvida: {details['entity_match']}")
+
+    print("\n--- Teste de janela de linha de base histórica (max_results=0, sem efetch) ---")
+    baseline_result = pubmed.search_articles(
+        asset["botanical_or_cas"][0], exclusions=asset["exclusions"],
+        max_results=0, days=pubmed.TRACTION_WINDOW_DAYS + 1095, end_days_ago=pubmed.TRACTION_WINDOW_DAYS
+    )
+    print(f"Janela de linha de base: {baseline_result['date_range']['start']} a {baseline_result['date_range']['end']} (sem sobreposição com os últimos {pubmed.TRACTION_WINDOW_DAYS} dias)")
+    print(f"Contagem bruta na linha de base: {baseline_result['count']}")
+    print(f"PMIDs retornados (deve ser vazio, max_results=0): {baseline_result['pmids']}")

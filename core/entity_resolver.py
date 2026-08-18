@@ -19,6 +19,63 @@ GLOBAL_EXCLUSIONS: List[str] = [
     "wastewater treatment"
 ]
 
+# Filtragem de relevância tópica em 3 níveis (contraparte do GLOBAL_EXCLUSIONS,
+# que é uma lista negativa). Um match por nome botânico/CAS/alias prova que o
+# texto menciona o ativo (Nível 1), mas não prova que o achado é relevante
+# para aplicação dermocosmética/nutracêutica - ex.: um artigo sobre
+# consolidação de fratura mandibular pode mencionar "Psoralea corylifolia"
+# sem ter qualquer relação com skincare. resolve() calcula um relevance_level
+# (1/2/3) para todo texto, independente do ativo:
+#   Nível 1 - Correspondência de Entidade: só o nome/CAS/alias bate (_match_asset).
+#   Nível 2 - Sinal Tópico/Aplicado: o texto também contém um termo geral de
+#             contexto dermatológico/nutracêutico (TOPICAL_CONTEXT_TERMS).
+#   Nível 3 - Evidência de Produto/Formulação: o texto contém, além disso, um
+#             termo de formulação/estudo aplicado (PRODUCT_FORMULATION_TERMS)
+#             - evidência mais forte que um simples sinal tópico genérico.
+# require_topical_context=True (usado por connectors/pubmed.py) rejeita
+# relevance_level < 2, mesmo que o nome do ativo esteja presente. Termos em
+# inglês, pois títulos/resumos do PubMed são majoritariamente em inglês.
+TOPICAL_CONTEXT_TERMS: List[str] = [
+    # dermatologia / pele / uso tópico
+    "skin", "skincare", "cutaneous", "dermal", "dermis", "epidermis", "epidermal",
+    "dermatolog", "topical", "cosmetic", "cosmeceutical", "keratinocyte", "fibroblast",
+    "collagen", "wrinkle", "photoaging", "photo-aging", "photoprotect", "melanin",
+    "melanocyte", "pigmentation", "hyperpigmentation", "moisturiz", "anti-aging",
+    "antiaging", "acne", "eczema", "psoriasis", "rosacea", "sunscreen", "spf",
+    "elastin", "sebum", "sebaceous", "scalp", "skin barrier",
+    # nutracêutico / suplementação funcional
+    "nutraceutical", "nutricosmetic", "dietary supplement", "functional food",
+    "oral supplementation", "antioxidant supplementation"
+]
+
+# Evidência de Produto/Formulação (Nível 3) - mais específica que um simples
+# termo tópico genérico: indica que o achado vem de um estudo aplicado
+# (ensaio clínico, teste em pele/tecido) ou de uma composição/formulação real,
+# não apenas de um artigo que menciona a palavra "pele" de passagem.
+PRODUCT_FORMULATION_TERMS: List[str] = [
+    "formulation", "emulsion", "serum", "lotion", "cream base", "cosmetic product",
+    "finished product", "clinical trial", "randomized controlled trial",
+    "double-blind", "human subjects", "in vivo", "ex vivo", "clinical study",
+    "efficacy study", "skin wound", "cutaneous wound", "skin equivalent",
+    "reconstructed skin", "skin explant", "patch test", "dermatologically tested"
+]
+
+
+def _build_context_pattern(terms: List[str]) -> "re.Pattern":
+    """
+    Compila os termos de um vocabulário de contexto num único padrão, com
+    fronteira de palavra só na abertura de cada termo (não no fechamento),
+    para que radicais como "dermatolog"/"moisturiz"/"photoprotect" casem
+    também com suas flexões (dermatology/dermatological, moisturizing,
+    photoprotective...) sem deixar de bloquear falsos positivos no meio de
+    outra palavra.
+    """
+    return re.compile(r'\b(' + '|'.join(re.escape(term) for term in terms) + r')', re.IGNORECASE)
+
+
+_TOPICAL_CONTEXT_PATTERN = _build_context_pattern(TOPICAL_CONTEXT_TERMS)
+_PRODUCT_FORMULATION_PATTERN = _build_context_pattern(PRODUCT_FORMULATION_TERMS)
+
 
 class EntityResolver:
     """
@@ -71,15 +128,51 @@ class EntityResolver:
                 return True
         return False
 
-    def resolve(self, text: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _relevance_level(text: str) -> int:
+        """
+        Calcula o Nível de relevância tópica (1/2/3) de um texto, independente
+        de qual ativo eventualmente casar nele:
+          1 - nenhum termo de contexto tópico/produto encontrado (relevância
+              não pode ser confirmada além da simples correspondência de nome).
+          2 - contém termo de TOPICAL_CONTEXT_TERMS (sinal tópico/aplicado).
+          3 - contém termo de TOPICAL_CONTEXT_TERMS *e* de
+              PRODUCT_FORMULATION_TERMS (evidência de produto/formulação).
+        """
+        has_topical = bool(_TOPICAL_CONTEXT_PATTERN.search(text))
+        has_product = bool(_PRODUCT_FORMULATION_PATTERN.search(text))
+        if has_topical and has_product:
+            return 3
+        if has_topical:
+            return 2
+        return 1
+
+    def resolve(self, text: str, require_topical_context: bool = False) -> Optional[Dict[str, Any]]:
         """
         Dada uma string de entrada (ex: título de artigo ou patente), retorna
         sempre o registro canônico padronizado do Ativo correspondente, mesclado
-        com os metadados do match (match_type, confidence_score). Textos que
-        caem em uma regra de exclusão são tratados como não-match, evitando
-        ruído fora da aplicação tópica/cosmética e contagem dupla de evidências.
+        com os metadados do match (match_type, confidence_score, relevance_level).
+        Textos que caem em uma regra de exclusão são tratados como não-match,
+        evitando ruído fora da aplicação tópica/cosmética e contagem dupla de
+        evidências.
+
+        Todo match recebe um `relevance_level` (1/2/3, ver _relevance_level) -
+        Nível 1 (Correspondência de Entidade), Nível 2 (Sinal Tópico/Aplicado)
+        ou Nível 3 (Evidência de Produto/Formulação). `require_topical_context=True`
+        reforça o filtro: o texto precisa atingir ao menos o Nível 2 para o
+        match ser aceito - caso contrário, é tratado como não-match mesmo que o
+        nome do ativo esteja presente (ex.: um artigo sobre fratura mandibular
+        que menciona "Psoralea corylifolia" não deve contar como evidência
+        para Bakuchiol). Usado por connectors/pubmed.py para título+resumo de
+        artigos, onde o risco de contexto irrelevante é maior do que em
+        títulos de patente (connectors/patents.py não usa esse gate, mas ainda
+        recebe o relevance_level calculado, sem filtro).
         """
         normalized_input = self._normalize_text(text)
+        relevance_level = self._relevance_level(normalized_input)
+
+        if require_topical_context and relevance_level < 2:
+            return None
 
         for asset in self.assets:
             if self._is_excluded(asset, normalized_input):
@@ -87,7 +180,7 @@ class EntityResolver:
 
             match_meta = self._match_asset(asset, text, normalized_input)
             if match_meta:
-                return {**self._standardize_record(asset), **match_meta}
+                return {**self._standardize_record(asset), **match_meta, "relevance_level": relevance_level}
 
         # Nenhum ativo reconhecido no texto (ou apenas em contexto excluído)
         return None
@@ -125,3 +218,11 @@ if __name__ == "__main__":
     # Teste usando regra de exclusão (contexto sistêmico/oral, não tópico)
     resultado_excluido = resolver.resolve("Tranexamic acid administered intravenously for postpartum hemorrhage.")
     print("Resultado do Teste (excluído):", resultado_excluido)
+
+    # Teste dos 3 níveis de relevância tópica
+    texto_nivel1 = "A brief note on Psoralea corylifolia taxonomy and distribution."
+    texto_nivel2 = "Psoralea corylifolia extract shows anti-aging effects on skin collagen."
+    texto_nivel3 = "A randomized controlled clinical trial of a topical emulsion formulation containing Psoralea corylifolia extract for skin wrinkle reduction."
+    for label, texto in [("Nível 1 esperado", texto_nivel1), ("Nível 2 esperado", texto_nivel2), ("Nível 3 esperado", texto_nivel3)]:
+        resultado = resolver.resolve(texto)
+        print(f"{label}: relevance_level={resultado['relevance_level'] if resultado else None}")

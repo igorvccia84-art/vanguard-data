@@ -10,13 +10,20 @@ from core.entity_resolver import EntityResolver
 from connectors.pubmed import PubMedConnector
 from connectors.patents import PatentConnector
 from connectors.regulatory_comex import RegulatoryComexConnector
-from core.score_engine import ScoreEngine, MODEL_VERSION
+from core.score_engine import ScoreEngine, MODEL_VERSION, SCI_BASELINE_HISTORY_DAYS, PROVISIONAL_WEIGHTS_DISCLAIMER
 from core.database import DatabaseManager, SCHEMA_VERSION
 from core.llm_analysis import LLMAnalysisEngine
-from core.predictive_ranking import PredictiveRankingEngine
+from core.predictive_ranking import PredictiveRankingEngine, TIER_INSUFFICIENT_DATA
 from reports.pdf_generator import PDFReportGenerator
 
 LANGUAGES = ["PT-BR", "PT-PT", "ES"]
+
+# Jurisdições consideradas por RegulatoryComexConnector.get_regulatory_matrix()
+# no cálculo do pior caso regulatório de cada ativo - exibidas como nota
+# metodológica de nível de relatório em reports/pdf_generator.py.
+REGULATORY_JURISDICTIONS_MONITORED = [
+    "Anvisa (Brasil)", "Regulamento (CE) 1223/2009 (UE)", "FDA (EUA, mock/ilustrativo)"
+]
 
 
 def resolve_search_query(asset: dict) -> str:
@@ -64,6 +71,7 @@ def main():
         print("\n" + "=" * 70)
         print(f"[FASE 1] COLETA E SCORING DOS {len(assets)} ATIVOS DO CATÁLOGO")
         print("=" * 70)
+        print(f"[Ressalva] {PROVISIONAL_WEIGHTS_DISCLAIMER}")
 
         all_evaluations = []
         period_start = None
@@ -75,34 +83,82 @@ def main():
             search_query = resolve_search_query(asset)
 
             # PubMed: aplica as exclusões do ativo diretamente na query, restringe à janela de 15
-            # dias (data de publicação), recebe PMIDs + query_hash
+            # dias (data de publicação), recebe PMIDs + query_hash. Estes são os PMIDs de
+            # "novidade" exibidos no relatório - só os com hook de verificação confirmado
+            # (fetch_article_details -> verified=True) chegam ao PDF (blindagem contra PMID
+            # inexistente/fora de contexto).
             pubmed_search = pubmed_conn.search_articles(search_query, exclusions=exclusions, max_results=5)
             pubmed_results = [pubmed_conn.fetch_article_details(pmid) for pmid in pubmed_search["pmids"]]
+            verified_pmids = [d["pmid"] for d in pubmed_results if d.get("verified")]
             if period_start is None:
                 period_start = pubmed_search["date_range"]["start"]
                 period_end = pubmed_search["date_range"]["end"]
+
+            # PubMed (Tração): segunda busca sobre a janela histórica móvel de 12 meses
+            # (TRACTION_WINDOW_DAYS) - usada exclusivamente para calcular Tração Científica
+            # (core/score_engine.py), nunca para exibir PMIDs de novidade no relatório.
+            pubmed_traction_search = pubmed_conn.search_articles(
+                search_query, exclusions=exclusions, max_results=10, days=pubmed_conn.TRACTION_WINDOW_DAYS
+            )
+            pubmed_traction_results = [pubmed_conn.fetch_article_details(pmid) for pmid in pubmed_traction_search["pmids"]]
+
+            # PubMed (Linha de Base Histórica): janela de 36 meses ESTRITAMENTE
+            # ANTERIOR aos 12 meses de análise (sem sobreposição), usada só para
+            # o componente [G] de calculate_scientific_traction_breakdown
+            # (core/score_engine.py). max_results=0 -> só a contagem bruta do
+            # PubMed, sem efetch/Entity Resolution (custo de API mínimo).
+            pubmed_baseline_search = pubmed_conn.search_articles(
+                search_query, exclusions=exclusions, max_results=0,
+                days=pubmed_conn.TRACTION_WINDOW_DAYS + SCI_BASELINE_HISTORY_DAYS,
+                end_days_ago=pubmed_conn.TRACTION_WINDOW_DAYS
+            )
 
             # Patentes: aplica exclusões, restringe à janela de 15 dias (publication_date), deduplica
             # por família de patentes, recebe resultados + query_hash
             patent_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions)
             patent_results = [patent_conn.process_patent(p) for p in patent_search["results"]]
 
+            # Patentes (Tração): mesma janela histórica móvel de 12 meses, para Tração Industrial.
+            # Patentes estão sujeitas à defasagem legal entre depósito e publicação - a janela de
+            # 12 meses é mais representativa da proteção industrial real do que a de 15 dias.
+            patent_traction_search = patent_conn.fetch_patents_mock(
+                search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS
+            )
+            patent_traction_results = [patent_conn.process_patent(p) for p in patent_traction_search["results"]]
+
             # Regulatório/Comex: dossiê consolidado - Alertas Regulatórios e Sinais Comerciais/Comex + query_hash.
-            # Jurisdição baseline PT-BR (Anvisa) usada para a coleta e o ranking preditivo; os 8
-            # ativos selecionados têm seus dados regulatórios recalculados por idioma na Fase 3.
+            # Jurisdição baseline PT-BR (Anvisa) usada para o dossiê comercial (R_trade permanece
+            # regional - não é um "pior caso" cross-jurisdição); os 8 ativos selecionados têm seus
+            # dados regulatórios/comerciais recalculados por idioma na Fase 3.
             hs_code = asset.get("hs_codes", [None])[0]
             dossier = comex_conn.get_asset_dossier(asset_id, hs_code=hs_code, lang="PT-BR")
-            regulatory_alerts = dossier["alertas_regulatorios"]
             commercial_signals = dossier["sinais_comerciais_comex"]
 
-            query_hashes = [pubmed_search["query_hash"], patent_search["query_hash"], dossier["query_hash"]]
+            # Matriz Regulatória cross-jurisdição (Anvisa/UE/FDA) - o Alerta Regulatório usado
+            # na árvore de precedência (core/predictive_ranking.py) passa a refletir o "Máximo
+            # de severidade regulatória observado entre as jurisdições monitoradas", não só a
+            # jurisdição local do idioma do relatório.
+            regulatory_matrix = comex_conn.get_regulatory_matrix(asset_id)
+            regulatory_alerts = regulatory_matrix["max_severity_status"]
 
+            query_hashes = [
+                pubmed_search["query_hash"], pubmed_traction_search["query_hash"],
+                pubmed_baseline_search["query_hash"],
+                patent_search["query_hash"], patent_traction_search["query_hash"],
+                dossier["query_hash"]
+            ]
+
+            # Tração Científica calculada sobre o modelo de 4 componentes V/G/A/Q
+            # (core/score_engine.py calculate_scientific_traction_breakdown) - [G] usa
+            # baseline_36m_count (contagem bruta na janela de 36 meses estritamente
+            # anterior aos 12 meses de análise, sem sobreposição).
             assessment = score_engine.generate_assessment(
-                pubmed_data=pubmed_results,
-                patent_data=patent_results,
+                pubmed_data=pubmed_traction_results,
+                patent_data=patent_traction_results,
                 regulatory_alerts=regulatory_alerts,
                 commercial_signals=commercial_signals,
-                query_hashes=query_hashes
+                query_hashes=query_hashes,
+                baseline_36m_count=pubmed_baseline_search["count"]
             )
 
             # Persistência auditável: avaliação do ativo + fontes de evidência (evaluation_evidence_sources)
@@ -115,6 +171,16 @@ def main():
                 items_found=pubmed_search["count"]
             )
             db_manager.save_evidence_source(
+                evaluation_id, source_type="PUBMED_TRACTION_12M", query_hash=pubmed_traction_search["query_hash"],
+                raw_response_summary=json.dumps(pubmed_traction_search["raw_metadata"], ensure_ascii=False),
+                items_found=pubmed_traction_search["count"]
+            )
+            db_manager.save_evidence_source(
+                evaluation_id, source_type="PUBMED_BASELINE_36M", query_hash=pubmed_baseline_search["query_hash"],
+                raw_response_summary=json.dumps(pubmed_baseline_search["raw_metadata"], ensure_ascii=False),
+                items_found=pubmed_baseline_search["count"]
+            )
+            db_manager.save_evidence_source(
                 evaluation_id, source_type="PATENTS", query_hash=patent_search["query_hash"],
                 raw_response_summary=json.dumps({
                     "total_found": patent_search["total_found"],
@@ -122,6 +188,15 @@ def main():
                     "duplicate_families_collapsed": patent_search["duplicate_families_collapsed"]
                 }, ensure_ascii=False),
                 items_found=patent_search["total_after_dedup"]
+            )
+            db_manager.save_evidence_source(
+                evaluation_id, source_type="PATENTS_TRACTION_12M", query_hash=patent_traction_search["query_hash"],
+                raw_response_summary=json.dumps({
+                    "total_found": patent_traction_search["total_found"],
+                    "total_after_dedup": patent_traction_search["total_after_dedup"],
+                    "duplicate_families_collapsed": patent_traction_search["duplicate_families_collapsed"]
+                }, ensure_ascii=False),
+                items_found=patent_traction_search["total_after_dedup"]
             )
             db_manager.save_evidence_source(
                 evaluation_id, source_type="REGULATORY_COMEX", query_hash=dossier["query_hash"],
@@ -144,14 +219,22 @@ def main():
                 "asset_id": asset_id,
                 "canonical_name": canonical_name,
                 "tracao_cientifica": assessment["tracao_cientifica"],
+                "tracao_cientifica_componentes": assessment["tracao_cientifica_componentes"],
                 "tracao_industrial": assessment["tracao_industrial"],
                 "risco_oferta": assessment["risco_oferta"],
+                "alerta_regulatorio": assessment["alerta_regulatorio"],
+                "sinal_comercial_comex": assessment["sinal_comercial_comex"],
                 "confianca_sinal": assessment["confianca_sinal"],
-                "pmids": pubmed_search["pmids"],
+                "evidencias_verificadas": assessment["evidencias_verificadas"],
+                "nivel_evidencia_maximo": assessment["nivel_evidencia_maximo"],
+                "pubmed_raw_count_12m": pubmed_traction_search["count"],
+                "tem_exclusoes": bool(exclusions),
+                "pmids": verified_pmids,
                 "patent_ids": [p["patent_id"] for p in patent_search["results"]],
                 "hs_code": hs_code,
-                "_pubmed_results": pubmed_results,
-                "_patent_results": patent_results
+                "pubmed_baseline_count": pubmed_baseline_search["count"],
+                "_pubmed_traction_results": pubmed_traction_results,
+                "_patent_traction_results": patent_traction_results
             })
 
         # 5. Fase 2: filtro preditivo - seleciona exatamente 8 ativos, categorizados
@@ -161,6 +244,24 @@ def main():
         selected = ranking_engine.select_predictive_assets(all_evaluations)
         for s in selected:
             print(f"  {s['asset_id']} {s['canonical_name']:<24} → {s['predictive_category']}")
+
+        # Classificação do catálogo COMPLETO pela árvore de precedência (auditoria interna -
+        # não afeta o relatório, que só exibe os 8 selecionados acima).
+        print("\n  --- Matriz de Classificação (catálogo completo, árvore de precedência) ---")
+        tier_counts = {}
+        for e in all_evaluations:
+            tier = ranking_engine.classify_precedence_tier(e)
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        for tier, count in tier_counts.items():
+            print(f"    {tier}: {count} ativo(s)")
+
+        # Relatório de Cobertura: causa raiz dos ativos em "Dados Insuficientes/Não
+        # Classificado" (auditoria interna - não entra no PDF).
+        coverage_report = ranking_engine.generate_coverage_report(all_evaluations)
+        if coverage_report:
+            print(f"\n  --- Relatório de Cobertura ({len(coverage_report)} ativo(s) em {TIER_INSUFFICIENT_DATA}) ---")
+            for row in coverage_report:
+                print(f"    {row['asset_id']} {row['canonical_name']:<24} -> {row['causa_raiz']}")
 
         # 6. Fase 3: síntese via LLM (Claude Sonnet 5) apenas para os 8 selecionados,
         #    com dados regulatórios, Risco de Oferta e recomendações recalculados
@@ -179,11 +280,29 @@ def main():
             asset_id = item["asset_id"]
             print(f"\n🔍 Sintetizando: {canonical_name} ({asset_id}) [{item['predictive_category']}]")
 
-            evidence_summary = llm_engine.summarize_evidence(canonical_name, item["_pubmed_results"], item["_patent_results"])
+            evidence_summary = llm_engine.summarize_evidence(
+                canonical_name, item["_pubmed_traction_results"], item["_patent_traction_results"]
+            )
             print(f"   🤖 Resumo: {evidence_summary[:90]}...")
 
+            # Trava determinística pós-LLM (core/llm_analysis.py): tier real do ativo
+            # (não o predictive_category exibido, que pode vir do preenchimento de
+            # último recurso - ver core/predictive_ranking.py) OU confiança baixa
+            # bloqueiam qualquer recomendação executiva de compra/priorização,
+            # independente do idioma.
+            is_insufficient_data = (
+                ranking_engine.classify_precedence_tier(item) == TIER_INSUFFICIENT_DATA
+                or item["confianca_sinal"] == "BAIXA"
+            )
+
+            # Matriz Regulatória cross-jurisdição (Anvisa/UE/FDA) - mesma lógica da Fase 1,
+            # não depende do idioma do relatório (calculada uma vez por ativo).
+            item_regulatory_matrix = comex_conn.get_regulatory_matrix(asset_id)
+
             for lang in LANGUAGES:
-                # Dossiê regulatório/comex específico da jurisdição do idioma do relatório
+                # Dossiê regulatório/comex específico da jurisdição do idioma do relatório -
+                # usado para a narrativa regional da LLM (generate_recommendations), não para
+                # o score da tabela, que usa o pior caso cross-jurisdição (ver abaixo).
                 jurisdiction_dossier = comex_conn.get_asset_dossier(asset_id, hs_code=item["hs_code"], lang=lang)
                 if lang not in regional_authorities:
                     regional_authorities[lang] = {
@@ -192,11 +311,12 @@ def main():
                     }
 
                 jurisdiction_assessment = score_engine.generate_assessment(
-                    pubmed_data=item["_pubmed_results"],
-                    patent_data=item["_patent_results"],
-                    regulatory_alerts=jurisdiction_dossier["alertas_regulatorios"],
+                    pubmed_data=item["_pubmed_traction_results"],
+                    patent_data=item["_patent_traction_results"],
+                    regulatory_alerts=item_regulatory_matrix["max_severity_status"],
                     commercial_signals=jurisdiction_dossier["sinais_comerciais_comex"],
-                    query_hashes=[jurisdiction_dossier["query_hash"]]
+                    query_hashes=[jurisdiction_dossier["query_hash"]],
+                    baseline_36m_count=item["pubmed_baseline_count"]
                 )
 
                 assessment_view = {
@@ -205,11 +325,20 @@ def main():
                     "risco_oferta": jurisdiction_assessment["risco_oferta"],
                     "confianca_sinal": jurisdiction_assessment["confianca_sinal"]
                 }
+                # Recomendações de alta confiança só para evidência de Nível 2/3
+                # (core/entity_resolver.py) - Nível 1/insuficiente força um
+                # framing deliberadamente conservador na LLM (ver
+                # core/llm_analysis.py generate_recommendations).
+                high_confidence = jurisdiction_assessment["nivel_evidencia_maximo"] >= 2
                 recs = llm_engine.generate_recommendations(
                     canonical_name, assessment_view,
                     regulatory_alerts=jurisdiction_dossier["alertas_regulatorios"],
                     commercial_signals=jurisdiction_dossier["sinais_comerciais_comex"],
-                    lang=lang
+                    lang=lang,
+                    pmids=item["pmids"],
+                    patent_ids=item["patent_ids"],
+                    high_confidence=high_confidence,
+                    is_insufficient_data=is_insufficient_data
                 )
 
                 evaluations_by_lang[lang].append({
@@ -240,7 +369,8 @@ def main():
                 run_id=run_id, schema_version=SCHEMA_VERSION, model_version=MODEL_VERSION,
                 period_start=period_start, period_end=period_end,
                 regulatory_body=authorities.get("regulatory_body"),
-                trade_source=authorities.get("trade_source")
+                trade_source=authorities.get("trade_source"),
+                regulatory_matrix={"jurisdictions_monitored": REGULATORY_JURISDICTIONS_MONITORED}
             )
 
         db_manager.complete_run(run_id, status="COMPLETED")

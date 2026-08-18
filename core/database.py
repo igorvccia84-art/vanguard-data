@@ -20,7 +20,7 @@ DEFAULT_DOMAIN = {
 DEFAULT_PRODUCT = {
     "product_code": "PHYTODEMAND_REPORT",
     "product_name": "PhytoDemand Report",
-    "description": "Relatório executivo de inteligência preditiva de ativos botânicos."
+    "description": "Protótipo auditável de triagem e priorização estratégica de ativos botânicos, com detecção de sinais antecipados."
 }
 
 

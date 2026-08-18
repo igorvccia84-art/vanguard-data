@@ -34,11 +34,11 @@ DEFAULT_REGIONAL_AUTHORITIES = {
     },
     "PT-PT": {
         "regulatory_body": "INFARMED (Autoridade Nacional do Medicamento e Produtos de Saúde, Portugal)",
-        "trade_source": "CosIng / ECHA (Regulamento (CE) 1223/2009, União Europeia)"
+        "trade_source": "Eurostat Comext / TARIC (dados de comércio exterior da União Europeia)"
     },
     "ES": {
         "regulatory_body": "AEMPS (Agencia Española de Medicamentos y Productos Sanitarios, España)",
-        "trade_source": "CosIng / ECHA (Reglamento (CE) 1223/2009, Unión Europea)"
+        "trade_source": "Eurostat Comext / TARIC (datos de comercio exterior de la Unión Europea)"
     }
 }
 
@@ -55,17 +55,17 @@ PREDICTIVE_CATEGORY_LABELS = {
     "PT-BR": {
         "Emerging Stars": "Estrela Emergente",
         "High-Risk / Supply Alert": "Risco Alto / Alerta de Oferta",
-        "Disruptive Dark Horses": "Aposta Disruptiva (Dark Horse)",
+        "Disruptive Dark Horses": "Sinal Científico sem Confirmação Industrial",
     },
     "PT-PT": {
         "Emerging Stars": "Estrela Emergente",
         "High-Risk / Supply Alert": "Risco Elevado / Alerta de Abastecimento",
-        "Disruptive Dark Horses": "Aposta Disruptiva (Dark Horse)",
+        "Disruptive Dark Horses": "Sinal Científico sem Confirmação Industrial",
     },
     "ES": {
         "Emerging Stars": "Estrella Emergente",
         "High-Risk / Supply Alert": "Riesgo Alto / Alerta de Suministro",
-        "Disruptive Dark Horses": "Apuesta Disruptiva (Dark Horse)",
+        "Disruptive Dark Horses": "Señal Científica sin Confirmación Industrial",
     },
 }
 
@@ -74,19 +74,19 @@ PREDICTIVE_CATEGORY_LABELS = {
 # Linguagem simples e orientada a negócios (não-técnica), para leitura executiva.
 PREDICTIVE_CATEGORY_DEFINITIONS = {
     "PT-BR": {
-        "Emerging Stars": "Ativo com alta validação científica e forte proteção por patentes. Pronto para virar produto e liderar o mercado.",
-        "Disruptive Dark Horses": "Alta tração em pesquisas recentes, mas ainda pouco explorado pela indústria. Oportunidade para pioneirismo e diferenciação.",
-        "High-Risk / Supply Alert": "Forte interesse de mercado, porém com gargalos de fornecimento ou restrições regulatórias. Requer atenção de suprimentos.",
+        "Emerging Stars": "Ativo com alta validação científica e forte proteção por patentes observadas no período analisado.",
+        "Disruptive Dark Horses": "Tração científica observada sem correspondência de patentes verificada no período analisado - sinal ainda não confirmado industrialmente.",
+        "High-Risk / Supply Alert": "Sinal de mercado observado com gargalos de fornecimento ou restrições regulatórias identificados. Requer atenção de suprimentos.",
     },
     "PT-PT": {
-        "Emerging Stars": "Ativo com elevada validação científica e forte proteção por patentes. Pronto para se tornar produto e liderar o mercado.",
-        "Disruptive Dark Horses": "Elevada tração em investigação recente, mas ainda pouco explorado pela indústria. Oportunidade para pioneirismo e diferenciação.",
-        "High-Risk / Supply Alert": "Forte interesse de mercado, mas com estrangulamentos no abastecimento ou restrições regulatórias. Requer atenção da cadeia de abastecimento.",
+        "Emerging Stars": "Ativo com elevada validação científica e forte proteção por patentes observadas no período analisado.",
+        "Disruptive Dark Horses": "Tração científica observada sem correspondência de patentes verificada no período analisado - sinal ainda não confirmado industrialmente.",
+        "High-Risk / Supply Alert": "Sinal de mercado observado com estrangulamentos no abastecimento ou restrições regulatórias identificados. Requer atenção da cadeia de abastecimento.",
     },
     "ES": {
-        "Emerging Stars": "Activo con alta validación científica y fuerte protección por patentes. Listo para convertirse en producto y liderar el mercado.",
-        "Disruptive Dark Horses": "Alta tracción en investigaciones recientes, pero aún poco explotado por la industria. Oportunidad para el pionerismo y la diferenciación.",
-        "High-Risk / Supply Alert": "Fuerte interés de mercado, pero con cuellos de botella de suministro o restricciones regulatorias. Requiere atención de la cadena de suministro.",
+        "Emerging Stars": "Activo con alta validación científica y fuerte protección por patentes observadas en el período analizado.",
+        "Disruptive Dark Horses": "Tracción científica observada sin correspondencia de patentes verificada en el período analizado - señal aún no confirmada industrialmente.",
+        "High-Risk / Supply Alert": "Señal de mercado observada con cuellos de botella de suministro o restricciones regulatorias identificados. Requiere atención de la cadena de suministro.",
     },
 }
 
@@ -123,6 +123,34 @@ _DEGENERATE_TEXT_TOKENS = {
     "example", "sem dados", "no data", "null", "none", "undefined", "-", "--", "..."
 }
 _MIN_RECOMMENDATION_LENGTH = 20
+
+
+# Blindagem determinística contra PMID/patente alucinado pela LLM - camada
+# independente da mesma checagem em core/llm_analysis.py (reports/ não deve
+# depender do motor de LLM). Mesmo que a camada da LLM falhe, nenhum PMID ou
+# número de patente que não conste na allow-list real (vinda dos conectores)
+# chega ao PDF final.
+_PMID_MENTION_PATTERN = re.compile(r'\bPMID\s*[:\-]?\s*(\d{4,9})\b', re.IGNORECASE)
+_PATENT_MENTION_PATTERN = re.compile(r'\b([A-Z]{2}\d{4,}[A-Z]\d?)\b')
+
+
+def _scrub_unverified_identifiers(text: Optional[str], allowed_pmids: Optional[List[str]] = None, allowed_patent_ids: Optional[List[str]] = None) -> Optional[str]:
+    """Remove menções a PMID/patente no texto que não estejam na allow-list real coletada pelos conectores para este ativo."""
+    if not text:
+        return text
+
+    allowed_pmids_set = set(allowed_pmids or [])
+    allowed_patent_ids_norm = {pid.replace("-", "").upper() for pid in (allowed_patent_ids or [])}
+
+    def _strip_pmid(match: "re.Match") -> str:
+        return match.group(0) if match.group(1) in allowed_pmids_set else ""
+
+    def _strip_patent(match: "re.Match") -> str:
+        return match.group(0) if match.group(1).replace("-", "").upper() in allowed_patent_ids_norm else ""
+
+    cleaned = _PMID_MENTION_PATTERN.sub(_strip_pmid, text)
+    cleaned = _PATENT_MENTION_PATTERN.sub(_strip_patent, cleaned)
+    return re.sub(r'\s{2,}', ' ', cleaned).strip()
 
 
 def _is_degenerate_recommendation(text: Optional[str]) -> bool:
@@ -191,26 +219,31 @@ class PDFReportGenerator:
     Gera relatórios nos formatos HTML e PDF nos idiomas PT-BR, PT-PT e ES.
     Identidade visual: Verde Florestal (#1B4D3E) e Amarelo Dourado (#D4AF37) - sem azul.
 
-    Todo relatório carrega um bloco ostensivo de Rastreabilidade e Auditoria
-    (Run ID, Data/Hora de Processamento, Schema Version, Model Version, marca
-    Vanguard Data Intelligence e Período de Análise), repetido no cabeçalho/
-    rodapé de cada página impressa e detalhado no corpo do relatório. Os
-    identificadores reais das evidências coletadas (PMIDs do PubMed e
-    registros de patentes) aparecem associados diretamente à recomendação
-    estratégica de cada ativo, não em um bloco agregado genérico. Uma legenda
+    Identificadores técnicos de auditoria (Run ID, Schema Version, Model
+    Version, Data/Hora de Processamento) aparecem em uma única linha discreta
+    no rodapé de cada página, sem repetição em cabeçalhos ou caixas de
+    destaque do corpo - mantidos apenas para fins de auditoria interna. O
+    corpo do relatório traz, em vez disso, uma caixa de "Período de Análise e
+    Fontes de Dados" (Período, autoridade regulatória e fonte de comércio
+    exterior da jurisdição, e o aviso metodológico sobre a janela móvel de 12
+    meses). Os identificadores reais das evidências coletadas (PMIDs do
+    PubMed e registros de patentes) aparecem associados diretamente à
+    recomendação estratégica de cada ativo, não em um bloco agregado
+    genérico, e nunca incluem PMIDs/patentes gerados pela LLM. Uma legenda
     metodológica das categorias preditivas acompanha a tabela de ativos.
     """
 
     TRANSLATIONS = {
         "PT-BR": {
             "title": "PhytoDemand Report",
-            "subtitle": "Relatório Executivo de Inteligência Preditiva de Ativos",
+            "document_classification": "Relatório Interno de Revisão Técnica e Metodológica",
+            "subtitle": "Protótipo Auditável de Priorização Estratégica baseado em Sinais Científicos, Industriais, Regulatórios e Comerciais",
             "asset_id": "ID do Ativo",
             "canonical_name": "Nome Canônico",
-            "predictive_category": "Categoria Preditiva",
+            "predictive_category": "Categoria de Triagem",
             "sci_traction": "Tração Científica",
             "ind_traction": "Tração Industrial",
-            "supply_risk": "Risco de Oferta",
+            "supply_risk": "Sinal de Risco de Oferta Observado",
             "confidence": "Confiança do Sinal",
             "recommendations_title": "Recomendações Estratégicas",
             "col_asset": "Ativo",
@@ -219,7 +252,7 @@ class PDFReportGenerator:
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
             "footer": "Relatório gerado automaticamente pela Plataforma Vanguard Data (Brasil)",
-            "audit_title": "Rastreabilidade e Auditoria",
+            "audit_title": "Período de Análise e Fontes de Dados",
             "audit_run_id": "ID de Execução (Run ID)",
             "audit_processed_at": "Data/Hora de Processamento",
             "audit_schema_version": "Versão do Schema",
@@ -227,19 +260,26 @@ class PDFReportGenerator:
             "audit_brand": "Plataforma",
             "audit_period": "Período de Análise",
             "audit_period_to": "a",
-            "audit_period_window_suffix": "(Janela de 15 Dias)",
+            "audit_period_window_suffix": "(Novidades dos Últimos 15 Dias)",
             "audit_data_sources": "Fontes de Dados",
-            "methodology_title": "Legenda Metodológica das Categorias Preditivas"
+            "methodology_disclaimer": "Atualização quinzenal; tendência calculada sobre histórico móvel de 12 meses.",
+            "commercial_disclaimer": "Valores comerciais refletem o volume declarado no código alfandegário analisado e podem incluir outros insumos além do ativo.",
+            "patent_disclaimer": "Sinais industriais baseados em publicações públicas; depósitos recentes dos últimos 18 meses estão sujeitos a sigilo legal.",
+            "weights_disclaimer": "Pesos provisórios, ainda não calibrados por validação externa/backtesting.",
+            "regulatory_matrix_title": "Matriz Regulatória por Jurisdição",
+            "regulatory_matrix_max_severity": "Máximo de severidade regulatória observado entre as jurisdições monitoradas",
+            "methodology_title": "Legenda Metodológica das Categorias de Triagem"
         },
         "PT-PT": {
             "title": "PhytoDemand Report",
-            "subtitle": "Relatório Executivo de Inteligência Preditiva de Ativos",
+            "document_classification": "Relatório Interno de Revisão Técnica e Metodológica",
+            "subtitle": "Protótipo Auditável de Priorização Estratégica baseado em Sinais Científicos, Industriais, Regulatórios e Comerciais",
             "asset_id": "ID do Ativo",
             "canonical_name": "Nome Canónico",
-            "predictive_category": "Categoria Preditiva",
+            "predictive_category": "Categoria de Triagem",
             "sci_traction": "Tracção Científica",
             "ind_traction": "Tracção Industrial",
-            "supply_risk": "Risco de Oferta",
+            "supply_risk": "Sinal de Risco de Oferta Observado",
             "confidence": "Confiança do Sinal",
             "recommendations_title": "Recomendações Estratégicas",
             "col_asset": "Ativo",
@@ -248,7 +288,7 @@ class PDFReportGenerator:
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
             "footer": "Relatório gerado automaticamente pela Plataforma Vanguard Data (Portugal)",
-            "audit_title": "Rastreabilidade e Auditoria",
+            "audit_title": "Período de Análise e Fontes de Dados",
             "audit_run_id": "ID de Execução (Run ID)",
             "audit_processed_at": "Data/Hora de Processamento",
             "audit_schema_version": "Versão do Schema",
@@ -256,19 +296,26 @@ class PDFReportGenerator:
             "audit_brand": "Plataforma",
             "audit_period": "Período de Análise",
             "audit_period_to": "a",
-            "audit_period_window_suffix": "(Janela de 15 Dias)",
+            "audit_period_window_suffix": "(Novidades dos Últimos 15 Dias)",
             "audit_data_sources": "Fontes de Dados",
-            "methodology_title": "Legenda Metodológica das Categorias Preditivas"
+            "methodology_disclaimer": "Atualização quinzenal; tendência calculada sobre histórico móvel de 12 meses.",
+            "commercial_disclaimer": "Valores comerciais refletem o volume declarado no código alfandegário analisado e podem incluir outros insumos além do ativo.",
+            "patent_disclaimer": "Sinais industriais baseados em publicações públicas; depósitos recentes dos últimos 18 meses estão sujeitos a sigilo legal.",
+            "weights_disclaimer": "Pesos provisórios, ainda não calibrados por validação externa/backtesting.",
+            "regulatory_matrix_title": "Matriz Regulatória por Jurisdição",
+            "regulatory_matrix_max_severity": "Máximo de severidade regulatória observado entre as jurisdições monitoradas",
+            "methodology_title": "Legenda Metodológica das Categorias de Triagem"
         },
         "ES": {
             "title": "PhytoDemand Report",
-            "subtitle": "Informe Ejecutivo de Inteligencia Predictiva de Activos",
+            "document_classification": "Informe Interno de Revisión Técnica y Metodológica",
+            "subtitle": "Prototipo Auditable de Priorización Estratégica basado en Señales Científicas, Industriales, Regulatorias y Comerciales",
             "asset_id": "ID del Activo",
             "canonical_name": "Nombre Canónico",
-            "predictive_category": "Categoría Predictiva",
+            "predictive_category": "Categoría de Triaje",
             "sci_traction": "Tracción Científica",
             "ind_traction": "Tracción Industrial",
-            "supply_risk": "Riesgo de Oferta",
+            "supply_risk": "Señal de Riesgo de Oferta Observada",
             "confidence": "Confianza de la Señal",
             "recommendations_title": "Recomendaciones Estratégicas",
             "col_asset": "Activo",
@@ -277,7 +324,7 @@ class PDFReportGenerator:
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
             "footer": "Informe generado automáticamente por la Plataforma Vanguard Data",
-            "audit_title": "Trazabilidad y Auditoría",
+            "audit_title": "Período de Análisis y Fuentes de Datos",
             "audit_run_id": "ID de Ejecución (Run ID)",
             "audit_processed_at": "Fecha/Hora de Procesamiento",
             "audit_schema_version": "Versión del Esquema",
@@ -285,9 +332,15 @@ class PDFReportGenerator:
             "audit_brand": "Plataforma",
             "audit_period": "Período de Análisis",
             "audit_period_to": "a",
-            "audit_period_window_suffix": "(Ventana de 15 Días)",
+            "audit_period_window_suffix": "(Novedades de los Últimos 15 Días)",
             "audit_data_sources": "Fuentes de Datos",
-            "methodology_title": "Leyenda Metodológica de las Categorías Predictivas"
+            "methodology_disclaimer": "Actualización quincenal; la tendencia se calcula sobre un historial móvil de 12 meses.",
+            "commercial_disclaimer": "Los valores comerciales reflejan el volumen declarado en el código arancelario analizado y pueden incluir otros insumos además del activo.",
+            "patent_disclaimer": "Señales industriales basadas en publicaciones públicas; los depósitos recientes de los últimos 18 meses están sujetos a secreto legal.",
+            "weights_disclaimer": "Pesos provisionales, aún no calibrados por validación externa/backtesting.",
+            "regulatory_matrix_title": "Matriz Regulatoria por Jurisdicción",
+            "regulatory_matrix_max_severity": "Máximo de severidad regulatoria observado entre las jurisdicciones monitoreadas",
+            "methodology_title": "Leyenda Metodológica de las Categorías de Triaje"
         }
     }
 
@@ -342,9 +395,20 @@ class PDFReportGenerator:
         period_start: Optional[str] = None,
         period_end: Optional[str] = None,
         regulatory_body: Optional[str] = None,
-        trade_source: Optional[str] = None
+        trade_source: Optional[str] = None,
+        regulatory_matrix: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Gera o HTML e converte diretamente para arquivo PDF."""
+        """
+        Gera o HTML e converte diretamente para arquivo PDF.
+
+        `regulatory_matrix` (opcional): `{"jurisdictions_monitored": [...]}` -
+        lista das jurisdições consideradas (Anvisa/UE/FDA) no cálculo do
+        Alerta Regulatório de CADA ativo da tabela (que já reflete o pior
+        caso entre elas, ver main.py + connectors.regulatory_comex.get_regulatory_matrix())
+        - é uma nota metodológica de nível de relatório, não uma matriz por
+        ativo individual (o relatório cobre 8 ativos diferentes). Se omitido,
+        a seção não é exibida (uso standalone deste módulo).
+        """
         t = self.TRANSLATIONS.get(lang.upper(), self.TRANSLATIONS["PT-BR"])
 
         run_id = run_id or str(uuid.uuid4())
@@ -356,6 +420,16 @@ class PDFReportGenerator:
         default_authorities = DEFAULT_REGIONAL_AUTHORITIES.get(lang.upper(), DEFAULT_REGIONAL_AUTHORITIES["PT-BR"])
         regulatory_body = regulatory_body or default_authorities["regulatory_body"]
         trade_source = trade_source or default_authorities["trade_source"]
+
+        regulatory_matrix_html = ""
+        if regulatory_matrix:
+            jurisdictions_monitored = " · ".join(regulatory_matrix.get("jurisdictions_monitored", []))
+            regulatory_matrix_html = f"""
+            <div class="audit-row">
+                <div class="audit-label">{t['regulatory_matrix_title']}</div>
+                <div class="audit-value">{jurisdictions_monitored}</div>
+            </div>
+            """
 
         rows_html = ""
         for item in evaluations:
@@ -398,6 +472,11 @@ class PDFReportGenerator:
             if _is_degenerate_recommendation(compras_procurement):
                 compras_procurement = self._default_supply_recommendation(item.get("supply_risk"), lang.upper())
 
+            asset_pmids = item.get("pmids", []) or []
+            asset_patent_ids = item.get("patent_ids", []) or []
+            inovacao_pd = _scrub_unverified_identifiers(inovacao_pd, asset_pmids, asset_patent_ids)
+            compras_procurement = _scrub_unverified_identifiers(compras_procurement, asset_pmids, asset_patent_ids)
+
             evidence_tags = "".join(f'<span class="evidence-tag">{t["col_evidence_pmid"]}: {p}</span>' for p in item.get("pmids", []) or [])
             evidence_tags += "".join(
                 f'<span class="evidence-tag">{t["col_evidence_pat"]}: {self._format_patent_id(p)}</span>'
@@ -426,21 +505,27 @@ class PDFReportGenerator:
             </div>
             """
 
+        # Cabeçalho de página: identidade da marca/relatório apenas - sem
+        # identificadores técnicos (Run ID/Schema/Model), que ficam
+        # concentrados numa única linha discreta no rodapé (ver abaixo).
         audit_header_html = (
             f'<span class="audit-brand">{BRAND_NAME}</span>'
             f'<span class="audit-sep">|</span>'
-            f'<span>{t["audit_run_id"]}: {run_id}</span>'
-            f'<span class="audit-sep">|</span>'
-            f'<span>Schema v{schema_version}</span>'
-            f'<span class="audit-sep">|</span>'
-            f'<span>Model v{model_version}</span>'
+            f'<span>{t["title"]}</span>'
         )
+        # Rodapé de página: única linha discreta com a identificação técnica
+        # completa (Run ID, Schema, Model, Data/Hora de Processamento), para
+        # fins de auditoria interna - não repetida em nenhum outro bloco.
         audit_footer_html = (
-            f'{t["audit_processed_at"]}: {processed_at}'
-            f'<span class="audit-sep">|</span>'
             f'{BRAND_NAME}'
             f'<span class="audit-sep">|</span>'
             f'{t["audit_run_id"]}: {run_id}'
+            f'<span class="audit-sep">|</span>'
+            f'Schema v{schema_version}'
+            f'<span class="audit-sep">|</span>'
+            f'Model v{model_version}'
+            f'<span class="audit-sep">|</span>'
+            f'{t["audit_processed_at"]}: {processed_at}'
         )
 
         html_content = f"""<!DOCTYPE html>
@@ -508,6 +593,19 @@ class PDFReportGenerator:
             margin: 0;
             font-weight: normal;
         }}
+        .document-classification {{
+            display: inline-block;
+            color: {COLOR_FOREST_GREEN};
+            background-color: {COLOR_GOLD_PALE};
+            border: 1px solid {COLOR_GOLD_MUTED};
+            border-radius: 3px;
+            font-size: 7.5pt;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            padding: 2px 8px;
+            margin: 0 0 8px 0;
+        }}
         .audit-box {{
             border: 1.5px solid {COLOR_FOREST_GREEN};
             background-color: {COLOR_GOLD_PALE};
@@ -526,6 +624,12 @@ class PDFReportGenerator:
             display: table;
             width: 100%;
             margin-bottom: 8px;
+        }}
+        .methodology-disclaimer {{
+            margin: 6px 0 0 0;
+            font-size: 7pt;
+            font-style: italic;
+            color: #4a5568;
         }}
         .audit-row {{
             display: table-row;
@@ -672,32 +776,13 @@ class PDFReportGenerator:
 
     <div class="header">
         <h1>{t['title']}</h1>
+        <p class="document-classification">{t['document_classification']}</p>
         <h2>{t['subtitle']}</h2>
     </div>
 
     <div class="audit-box">
         <h3>{t['audit_title']}</h3>
         <div class="audit-grid">
-            <div class="audit-row">
-                <div class="audit-label">{t['audit_brand']}</div>
-                <div class="audit-value">{BRAND_NAME}</div>
-            </div>
-            <div class="audit-row">
-                <div class="audit-label">{t['audit_run_id']}</div>
-                <div class="audit-value">{run_id}</div>
-            </div>
-            <div class="audit-row">
-                <div class="audit-label">{t['audit_processed_at']}</div>
-                <div class="audit-value">{processed_at}</div>
-            </div>
-            <div class="audit-row">
-                <div class="audit-label">{t['audit_schema_version']}</div>
-                <div class="audit-value">{schema_version}</div>
-            </div>
-            <div class="audit-row">
-                <div class="audit-label">{t['audit_model_version']}</div>
-                <div class="audit-value">{model_version}</div>
-            </div>
             <div class="audit-row">
                 <div class="audit-label">{t['audit_period']}</div>
                 <div class="audit-value">{period_start} {t['audit_period_to']} {period_end} {t['audit_period_window_suffix']}</div>
@@ -706,7 +791,13 @@ class PDFReportGenerator:
                 <div class="audit-label">{t['audit_data_sources']}</div>
                 <div class="audit-value">{regulatory_body} · {trade_source}</div>
             </div>
+            {regulatory_matrix_html}
         </div>
+        <p class="methodology-disclaimer">{t['methodology_disclaimer']}</p>
+        <p class="methodology-disclaimer">{t['commercial_disclaimer']}</p>
+        <p class="methodology-disclaimer">{t['patent_disclaimer']}</p>
+        <p class="methodology-disclaimer">{t['weights_disclaimer']}</p>
+        {f'<p class="methodology-disclaimer">{t["regulatory_matrix_max_severity"]}.</p>' if regulatory_matrix else ''}
     </div>
 
     <table>

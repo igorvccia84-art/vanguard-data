@@ -10,6 +10,8 @@ truststore.inject_into_ssl()  # usa o armazenamento de certificados do SO (neces
 from dotenv import load_dotenv
 import anthropic
 
+from core.formatting import format_usd_estimate
+
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
@@ -38,14 +40,14 @@ REGION_CONTEXT = {
     "PT-PT": {
         "region_code": "PT",
         "market_label": "Portugal (mercado da União Europeia)",
-        "regulatory_framework": "Regulamento (CE) n.º 1223/2009 relativo aos produtos cosméticos (base CosIng/ECHA), com fiscalização nacional pelo INFARMED",
-        "trade_data_label": "base de fornecimento europeia (CosIng/ECHA)"
+        "regulatory_framework": "Regulamento (CE) n.º 1223/2009 relativo aos produtos cosméticos (base CosIng/ECHA - base informativa sem valor legal próprio), com fiscalização nacional pelo INFARMED",
+        "trade_data_label": "Eurostat Comext / TARIC (dados de comércio exterior da União Europeia)"
     },
     "ES": {
         "region_code": "ES",
         "market_label": "España (mercado de la Unión Europea)",
-        "regulatory_framework": "Reglamento (CE) n.º 1223/2009 sobre productos cosméticos (base CosIng/ECHA), con fiscalización nacional por la AEMPS",
-        "trade_data_label": "base de suministro europea (CosIng/ECHA)"
+        "regulatory_framework": "Reglamento (CE) n.º 1223/2009 sobre productos cosméticos (base CosIng/ECHA - base informativa sin valor legal propio), con fiscalización nacional por la AEMPS",
+        "trade_data_label": "Eurostat Comext / TARIC (datos de comercio exterior de la Unión Europea)"
     }
 }
 
@@ -58,14 +60,36 @@ STRICT_GROUNDING_DIRECTIVE = """DIRETRIZ DE FUNDAMENTAÇÃO ESTRITA (Strict Grou
 Você é um analista que trabalha exclusivamente com os dados fornecidos na mensagem do usuário. É terminantemente proibido:
 (1) inventar, extrapolar ou presumir números, percentuais, dosagens, resultados estatísticos ou qualquer dado quantitativo que não esteja explicitamente presente no contexto fornecido;
 (2) inventar mecanismos de ação, vias bioquímicas ou processos farmacológicos não mencionados no contexto fornecido;
-(3) inventar aplicações, indicações de uso, benefícios, estudos, autores ou publicações que não constem explicitamente no contexto fornecido.
+(3) inventar aplicações, indicações de uso, benefícios, estudos, autores ou publicações que não constem explicitamente no contexto fornecido;
+(4) inventar, completar, corrigir ou citar por conta própria qualquer PMID, número de patente ou código identificador - você só pode citar um PMID ou número de patente se ele aparecer literalmente, caractere por caractere, no contexto fornecido nesta mensagem; se não tiver certeza absoluta de um identificador, não o mencione;
+(5) atribuir dados financeiros, de volume de mercado ou de comércio exterior a uma base regulatória (ex.: CosIng/ECHA) - bases regulatórias só podem ser citadas para status regulatório, funções cosméticas e restrições legais;
+(6) apresentar o Risco de Oferta como um fato certo e definitivo - trate-o sempre como um sinal observado a partir dos dados disponíveis (ex.: "o sinal observado indica risco elevado de oferta"), nunca como uma previsão garantida;
+(7) tratar a ausência de patente recente no contexto fornecido como prova de baixo interesse industrial - depósitos dos últimos 18 meses podem estar sob sigilo legal (ainda não publicados) e não aparecem nas buscas públicas.
 Toda afirmação factual da sua resposta deve ser rastreável a um trecho específico do contexto fornecido nesta mensagem. Se o contexto fornecido for insuficiente, incompleto ou ausente para sustentar uma afirmação, declare essa limitação explicitamente em vez de preencher a lacuna com suposições ou conhecimento geral."""
+
+# Schema de saída estruturada de generate_recommendations(): cada recomendação
+# (inovacao_pd/compras_procurement) é decomposta em 'claim' (a recomendação
+# em si), 'evidence_ids' (PMIDs/patentes citados - validados contra a
+# allow-list real antes de liberar o payload para o gerador de PDF, ver
+# _validate_evidence_ids) e 'limitations' (o que a evidência disponível não
+# cobre) - força a LLM a expor o raciocínio de forma auditável, em vez de uma
+# única string de prosa onde afirmação e limitação se confundem.
+_CLAIM_BLOCK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "claim": {"type": "string"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "string"}
+    },
+    "required": ["claim", "evidence_ids", "limitations"],
+    "additionalProperties": False
+}
 
 RECOMMENDATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "inovacao_pd": {"type": "string"},
-        "compras_procurement": {"type": "string"}
+        "inovacao_pd": _CLAIM_BLOCK_SCHEMA,
+        "compras_procurement": _CLAIM_BLOCK_SCHEMA
     },
     "required": ["inovacao_pd", "compras_procurement"],
     "additionalProperties": False
@@ -138,6 +162,71 @@ def _is_degenerate_text(text: str) -> bool:
     return False
 
 
+# Blindagem determinística contra PMID/patente alucinado pela LLM (independente
+# da STRICT_GROUNDING_DIRECTIVE, que é apenas uma instrução ao modelo, não uma
+# garantia). Detecta padrões de PMID (ex.: "PMID 42596530") e de número de
+# patente EPO/WIPO (ex.: "EP3892258A1", "WO2024087654A1") em texto livre
+# gerado pela LLM, para checagem contra a allow-list real de IDs coletados
+# pelos conectores (connectors/pubmed.py, connectors/patents.py).
+_PMID_MENTION_PATTERN = re.compile(r'\bPMID\s*[:\-]?\s*(\d{4,9})\b', re.IGNORECASE)
+_PATENT_MENTION_PATTERN = re.compile(r'\b([A-Z]{2}\d{4,}[A-Z]\d?)\b')
+
+
+def _scrub_unverified_identifiers(text: str, allowed_pmids: List[str] = None, allowed_patent_ids: List[str] = None) -> str:
+    """
+    Remove qualquer menção a PMID ou número de patente no texto gerado pela
+    LLM que não esteja literalmente na allow-list de IDs reais coletados
+    pelos conectores para este ativo (nunca vindos da LLM). Isso é um
+    backstop determinístico: mesmo que a LLM ignore a STRICT_GROUNDING_DIRECTIVE
+    e cite um PMID/patente inventado (ou correto, mas fora de contexto), o
+    trecho é removido antes de o texto chegar ao relatório final.
+    """
+    if not text:
+        return text
+
+    allowed_pmids = set(allowed_pmids or [])
+    allowed_patent_ids_norm = {pid.replace("-", "").upper() for pid in (allowed_patent_ids or [])}
+
+    def _strip_pmid(match: "re.Match") -> str:
+        return match.group(0) if match.group(1) in allowed_pmids else ""
+
+    def _strip_patent(match: "re.Match") -> str:
+        return match.group(0) if match.group(1).replace("-", "").upper() in allowed_patent_ids_norm else ""
+
+    cleaned = _PMID_MENTION_PATTERN.sub(_strip_pmid, text)
+    cleaned = _PATENT_MENTION_PATTERN.sub(_strip_patent, cleaned)
+    return re.sub(r'\s{2,}', ' ', cleaned).strip()
+
+
+def _validate_evidence_ids(
+    evidence_ids: List[str],
+    allowed_pmids: List[str] = None,
+    allowed_patent_ids: List[str] = None,
+    context_label: str = ""
+) -> List[str]:
+    """
+    Valida cada evidence_id do campo estruturado 'evidence_ids' (RECOMMENDATION_SCHEMA)
+    contra a allow-list real de IDs coletados pelos conectores para este ativo.
+    Descarta (e loga) qualquer evidence_id que não exista na allow-list -
+    o payload liberado para reports/pdf_generator.py nunca carrega um
+    evidence_id não verificado, mesmo que a LLM o tenha citado.
+    """
+    if not evidence_ids:
+        return []
+
+    allowed_pmids_set = set(allowed_pmids or [])
+    allowed_patent_ids_norm = {pid.replace("-", "").upper() for pid in (allowed_patent_ids or [])}
+
+    valid_ids = []
+    for raw_id in evidence_ids:
+        eid = str(raw_id).strip()
+        if eid in allowed_pmids_set or eid.replace("-", "").upper() in allowed_patent_ids_norm:
+            valid_ids.append(eid)
+        else:
+            print(f"   ⚠️  evidence_id '{eid}' descartado (fora da allow-list real) {context_label}")
+    return valid_ids
+
+
 def _parse_score_value(score_str: Any) -> float:
     """Extrai o valor numérico de uma métrica no formato 'X.X/10' (ex.: score_engine.py)."""
     try:
@@ -184,6 +273,27 @@ _DEFAULT_INNOVATION_RECOMMENDATION = {
         "alta": "Tracción Científica e Industrial favorables para este activo: se recomienda priorizar la inversión en I+D para consolidar la posición de mercado y acelerar el desarrollo de nuevas formulaciones.",
         "media": "Señal científica/industrial moderada para este activo: se recomienda seguir la evolución de la literatura antes de comprometer recursos significativos de I+D.",
         "baixa": "Señal científica/industrial aún incipiente para este activo: se recomienda monitoreo continuo de la literatura emergente antes de cualquier inversión relevante en I+D."
+    }
+}
+
+
+# Trava determinística pós-LLM (validador, não instrução de prompt): quando o
+# ativo está em TIER_INSUFFICIENT_DATA (core/predictive_ranking.py) ou com
+# confianca_sinal == "BAIXA", nenhuma recomendação executiva de compra ou
+# priorização é emitida - a chamada à LLM é pulada inteiramente para os dois
+# campos (economiza custo de API) e este texto fixo é retornado no lugar.
+_INSUFFICIENT_DATA_HOLDING_STATEMENT = {
+    "PT-BR": {
+        "inovacao_pd": "Recomendação executiva de Inovação & P&D suspensa: dados insuficientes para embasar uma decisão de priorização deste ativo.",
+        "compras_procurement": "Recomendação executiva de Compras & Procurement suspensa: dados insuficientes para embasar uma decisão de compra deste ativo."
+    },
+    "PT-PT": {
+        "inovacao_pd": "Recomendação executiva de Inovação & I&D suspensa: dados insuficientes para embasar uma decisão de priorização deste ativo.",
+        "compras_procurement": "Recomendação executiva de Compras & Procurement suspensa: dados insuficientes para embasar uma decisão de compra deste ativo."
+    },
+    "ES": {
+        "inovacao_pd": "Recomendación ejecutiva de Innovación & I+D suspendida: datos insuficientes para fundamentar una decisión de priorización de este activo.",
+        "compras_procurement": "Recomendación ejecutiva de Compras & Procurement suspendida: datos insuficientes para fundamentar una decisión de compra de este activo."
     }
 }
 
@@ -252,7 +362,10 @@ Responda apenas com o resumo, sem introduções ou comentários adicionais."""
             return f"[Falha ao sintetizar evidências via LLM: {e.status_code} - {e.message}]"
 
         raw_text = next((b.text for b in response.content if b.type == "text"), "")
-        return _sanitize_text(raw_text)
+        sanitized = _sanitize_text(raw_text)
+        allowed_pmids = [a.get("pmid") for a in pubmed_articles if a.get("pmid")]
+        allowed_patent_ids = [p.get("patent_id") for p in patents if p.get("patent_id")]
+        return _scrub_unverified_identifiers(sanitized, allowed_pmids, allowed_patent_ids)
 
     def generate_recommendations(
         self,
@@ -260,7 +373,11 @@ Responda apenas com o resumo, sem introduções ou comentários adicionais."""
         assessment: Dict[str, Any],
         regulatory_alerts: Dict[str, Any] = None,
         commercial_signals: Dict[str, Any] = None,
-        lang: str = "PT-BR"
+        lang: str = "PT-BR",
+        pmids: List[str] = None,
+        patent_ids: List[str] = None,
+        high_confidence: bool = True,
+        is_insufficient_data: bool = False
     ) -> Dict[str, str]:
         """
         Gera recomendações dinâmicas de Inovação & P&D e Compras & Procurement
@@ -274,13 +391,47 @@ Responda apenas com o resumo, sem introduções ou comentários adicionais."""
         O prompt exige explicitamente que a análise cite esses dados regionais,
         para produzir recomendações realmente distintas por mercado, não uma
         análise genérica com apenas o nome do órgão regulatório trocado.
+
+        A LLM responde no formato estruturado RECOMMENDATION_SCHEMA (claim +
+        evidence_ids + limitations por recomendação) - cada evidence_id
+        citado é validado contra a allow-list real de PMIDs/patentes
+        ('pmids'/'patent_ids', vinda dos conectores) antes de compor o texto
+        final; qualquer ID fora da allow-list é descartado (_validate_evidence_ids).
+
+        `high_confidence=False` (nível de evidência do ativo < 2, ver
+        core/entity_resolver.py e core/score_engine.calculate_max_relevance_level)
+        restringe a LLM a um framing deliberadamente conservador: nenhuma
+        recomendação de alta confiança é emitida sem evidência de Nível 2/3 -
+        mas ainda produz uma recomendação (hedged).
+
+        `is_insufficient_data=True` (tier "Dados Insuficientes/Não Classificado"
+        de core/predictive_ranking.py OU confianca_sinal=="BAIXA") é uma trava
+        determinística mais forte que high_confidence: a chamada à LLM é
+        pulada inteiramente e um texto fixo de suspensão é retornado para os
+        dois campos - nenhuma recomendação executiva de compra ou priorização
+        é emitida quando a evidência não sustenta, ponto final (não é uma
+        instrução de prompt, que é só uma sugestão à LLM).
         """
+        if is_insufficient_data:
+            holding_statement = _INSUFFICIENT_DATA_HOLDING_STATEMENT.get(
+                lang.upper(), _INSUFFICIENT_DATA_HOLDING_STATEMENT["PT-BR"]
+            )
+            return dict(holding_statement)
+
         lang_key = lang.upper()
         regulatory_body = REGULATORY_BODY.get(lang_key, REGULATORY_BODY["PT-BR"])
         region = REGION_CONTEXT.get(lang_key, REGION_CONTEXT["PT-BR"])
         regulatory_alerts = regulatory_alerts or {}
         commercial_signals = commercial_signals or {}
         alerts_text = "; ".join(regulatory_alerts.get("alerts") or []) or "nenhum alerta específico registrado"
+
+        evidence_ids_hint = ", ".join((pmids or []) + (patent_ids or [])) or "nenhum"
+
+        confidence_instruction = (
+            "- O ativo tem evidência de Nível 2/3 (sinal tópico/aplicado ou de produto/formulação confirmado): pode usar um framing de confiança normal, sempre ancorado nos dados fornecidos."
+            if high_confidence else
+            "- ATENÇÃO: este ativo só tem evidência de Nível 1 (mera correspondência de nome, sem sinal tópico/aplicado confirmado) ou evidência insuficiente. NÃO escreva uma recomendação de alta confiança. O 'claim' deve ser explicitamente conservador (ex.: \"evidência preliminar sugere...\", \"ainda não é possível recomendar com confiança...\"), e 'limitations' DEVE declarar que a evidência disponível não passa do Nível 1/insuficiente para uma recomendação de alta confiança."
+        )
 
         prompt = f"""Você é um consultor estratégico de P&D e Procurement para a indústria dermocosmética, especializado no mercado de {region['market_label']}.
 
@@ -300,19 +451,26 @@ Alertas regulatórios específicos desta jurisdição: {alerts_text}
 Fonte de dados de suprimento/comércio: {region['trade_data_label']}
 Fornecedores mapeados nesta região: {commercial_signals.get('suppliers_count', 'N/A')}
 Tendência de oferta nesta região: {commercial_signals.get('trend', 'N/A')}
-Volume anual estimado (USD) nesta região: {commercial_signals.get('volume_usd_annual', 'N/A')}
-Risco de Oferta consolidado (regulatório + comercial) para {region['market_label']}: {assessment.get('risco_oferta')}
+Volume anual estimado (USD, faixa arredondada) nesta região: {format_usd_estimate(commercial_signals.get('volume_usd_annual'), lang=lang_key)}
+Sinal de Risco de Oferta Observado (regulatório + comercial) para {region['market_label']}: {assessment.get('risco_oferta')}
+
+RESSALVAS OBRIGATÓRIAS (considere-as ao escrever claim/limitations):
+- Os valores comerciais acima refletem o volume declarado no código alfandegário analisado e podem incluir outros insumos além deste ativo especificamente.
+- Sinais industriais (patentes) baseiam-se em publicações públicas; depósitos dos últimos 18 meses podem estar sob sigilo legal e não aparecer nesta busca.
+
+IDs DE EVIDÊNCIA DISPONÍVEIS PARA CITAÇÃO (não invente outros; use string vazia/array vazio se nenhum se aplicar a uma recomendação específica): {evidence_ids_hint}
 
 INSTRUÇÕES OBRIGATÓRIAS:
-- Gere duas recomendações curtas e acionáveis (2-3 frases cada), no idioma "{lang}".
-- As recomendações devem refletir especificidades REAIS do marco regulatório e da dinâmica de suprimento de {region['market_label']} listados acima: cite o marco regulatório e/ou o alerta específico ao justificar a recomendação de Inovação & P&D, e cite os dados de fornecedores/tendência ao justificar a de Compras & Procurement.
-- NÃO escreva uma análise genérica que sirva igualmente para outro mercado. O texto deve ser claramente distinguível do que seria escrito para outra região, mesmo quando as métricas globais forem idênticas.
-- NUNCA responda com um placeholder genérico (ex.: "placeholder", "N/A", "TBD", "a definir"). Mesmo com evidências científicas limitadas, produza sempre uma frase real e específica baseada nos dados regulatórios/comerciais fornecidos acima.
+- Responda no formato estruturado exigido: para cada recomendação, preencha 'claim' (a recomendação em si, curta e acionável, 2-3 frases, no idioma "{lang}"), 'evidence_ids' (só IDs da lista acima que sustentam diretamente esta recomendação) e 'limitations' (o que a evidência disponível NÃO cobre para esta recomendação).
+- As recomendações devem refletir especificidades REAIS do marco regulatório e da dinâmica de suprimento de {region['market_label']} listados acima: cite o marco regulatório e/ou o alerta específico ao justificar o 'claim' de Inovação & P&D, e cite os dados de fornecedores/tendência ao justificar o de Compras & Procurement.
+- NÃO escreva um 'claim' genérico que sirva igualmente para outro mercado. O texto deve ser claramente distinguível do que seria escrito para outra região, mesmo quando as métricas globais forem idênticas.
+- NUNCA responda com um placeholder genérico (ex.: "placeholder", "N/A", "TBD", "a definir") em 'claim'. Mesmo com evidências científicas limitadas, produza sempre uma frase real e específica baseada nos dados regulatórios/comerciais fornecidos acima, e declare a limitação em 'limitations' em vez de inflar o 'claim'.
+{confidence_instruction}
 
-1. Uma recomendação para o time de Inovação & P&D.
-2. Uma recomendação para o time de Compras & Procurement.
+1. Uma recomendação para o time de Inovação & P&D (campo inovacao_pd).
+2. Uma recomendação para o time de Compras & Procurement (campo compras_procurement).
 
-Responda apenas com o conteúdo das duas recomendações. Não inclua comentários sobre o processo de geração, marcadores de conclusão (ex.: "fim", "concluído", "pronto") ou qualquer texto após a última recomendação — pare assim que o conteúdo estiver completo."""
+Responda apenas com o JSON estruturado. Não inclua comentários sobre o processo de geração, marcadores de conclusão (ex.: "fim", "concluído", "pronto") ou qualquer texto após o JSON — pare assim que o conteúdo estiver completo."""
 
         # Rastreia o último par de textos obtidos (mesmo que degenerado) para poder
         # aproveitar o campo que veio válido caso só o outro precise de fallback.
@@ -344,8 +502,12 @@ Responda apenas com o conteúdo das duas recomendações. Não inclua comentári
                 last_failure = "falha ao interpretar resposta estruturada do LLM"
                 continue
 
-            last_inovacao = _sanitize_text(parsed.get("inovacao_pd", ""))
-            last_compras = _sanitize_text(parsed.get("compras_procurement", ""))
+            last_inovacao = self._compose_recommendation_text(
+                parsed.get("inovacao_pd", {}), pmids, patent_ids, canonical_name, "inovacao_pd"
+            )
+            last_compras = self._compose_recommendation_text(
+                parsed.get("compras_procurement", {}), pmids, patent_ids, canonical_name, "compras_procurement"
+            )
 
             if not _is_degenerate_text(last_inovacao) and not _is_degenerate_text(last_compras):
                 return {"inovacao_pd": last_inovacao, "compras_procurement": last_compras}
@@ -363,6 +525,38 @@ Responda apenas com o conteúdo das duas recomendações. Não inclua comentári
         compras_final = last_compras if not _is_degenerate_text(last_compras) else _default_supply_recommendation(assessment.get("risco_oferta"), lang_key)
 
         return {"inovacao_pd": inovacao_final, "compras_procurement": compras_final}
+
+    @staticmethod
+    def _compose_recommendation_text(
+        claim_block: Dict[str, Any],
+        pmids: List[str],
+        patent_ids: List[str],
+        canonical_name: str,
+        field_label: str
+    ) -> str:
+        """
+        Converte um bloco estruturado {claim, evidence_ids, limitations}
+        (RECOMMENDATION_SCHEMA) no texto final consumido por
+        reports/pdf_generator.py. Valida evidence_ids contra a allow-list
+        real (_validate_evidence_ids - só para auditoria/log, já que o texto
+        final não lista os IDs) e passa claim/limitations por
+        _scrub_unverified_identifiers (defesa em profundidade contra ID solto
+        em prosa, fora do array evidence_ids).
+        """
+        if not isinstance(claim_block, dict):
+            return ""
+
+        claim = _scrub_unverified_identifiers(_sanitize_text(claim_block.get("claim", "")), pmids, patent_ids)
+        limitations = _scrub_unverified_identifiers(_sanitize_text(claim_block.get("limitations", "")), pmids, patent_ids)
+
+        _validate_evidence_ids(
+            claim_block.get("evidence_ids") or [], pmids, patent_ids,
+            context_label=f"(ativo='{canonical_name}', campo='{field_label}')"
+        )
+
+        if not _is_degenerate_text(limitations):
+            return f"{claim} Limitações: {limitations}"
+        return claim
 
 
 if __name__ == "__main__":
@@ -397,14 +591,46 @@ if __name__ == "__main__":
 
     # Mesma métrica global (assessment), dossiê regional diferente - prova que a
     # análise diverge de fato entre mercados, não apenas troca o nome do órgão.
+    # pmids/patent_ids reais da mock_pubmed/mock_patents acima - allow-list para
+    # validação de evidence_ids (JSON estruturado claim/evidence_ids/limitations).
     for lang in ("PT-BR", "PT-PT"):
         dossier = mock_dossiers[lang]
         recs = engine.generate_recommendations(
             "Bakuchiol", mock_assessment,
             regulatory_alerts=dossier["regulatory_alerts"],
             commercial_signals=dossier["commercial_signals"],
-            lang=lang
+            lang=lang,
+            pmids=["42526372"],
+            patent_ids=["EP3892258A1"],
+            high_confidence=True
         )
-        print(f"\n=== {lang} ===")
+        print(f"\n=== {lang} (high_confidence=True) ===")
         print(f"Recomendação Inovação & P&D:\n{recs['inovacao_pd']}")
         print(f"\nRecomendação Compras & Procurement:\n{recs['compras_procurement']}")
+
+    # Teste do gate de baixa confiança (Nível 1/evidência insuficiente) - o
+    # 'claim' deve vir deliberadamente conservador e 'limitations' deve
+    # declarar a limitação de evidência.
+    recs_baixa_confianca = engine.generate_recommendations(
+        "Bakuchiol", mock_assessment,
+        regulatory_alerts=mock_dossiers["PT-BR"]["regulatory_alerts"],
+        commercial_signals=mock_dossiers["PT-BR"]["commercial_signals"],
+        lang="PT-BR",
+        pmids=["42526372"],
+        patent_ids=["EP3892258A1"],
+        high_confidence=False
+    )
+    print("\n=== PT-BR (high_confidence=False) ===")
+    print(f"Recomendação Inovação & P&D:\n{recs_baixa_confianca['inovacao_pd']}")
+    print(f"\nRecomendação Compras & Procurement:\n{recs_baixa_confianca['compras_procurement']}")
+
+    # Teste da trava determinística pós-LLM (is_insufficient_data=True) - a
+    # chamada à LLM deve ser pulada inteiramente, retornando o texto fixo de
+    # suspensão nos dois campos, sem nenhuma recomendação executiva.
+    for lang in ("PT-BR", "ES"):
+        recs_insuficiente = engine.generate_recommendations(
+            "Bakuchiol", mock_assessment, lang=lang, is_insufficient_data=True
+        )
+        print(f"\n=== {lang} (is_insufficient_data=True - trava pós-LLM, sem chamada à API) ===")
+        print(f"Recomendação Inovação & P&D:\n{recs_insuficiente['inovacao_pd']}")
+        print(f"\nRecomendação Compras & Procurement:\n{recs_insuficiente['compras_procurement']}")

@@ -12,7 +12,12 @@ if sys.stdout.encoding != 'utf-8':
 class RegulatoryComexConnector:
     """
     Conector para dados Regulatórios (Anvisa/INFARMED/AEMPS/CosIng-ECHA) e
-    Comércio Exterior (Comex Stat/CosIng/HS Codes). Cada consulta é auditável:
+    Comércio Exterior (Comex Stat, Brasil; Eurostat Comext/TARIC, União
+    Europeia). CosIng/ECHA é citado exclusivamente para status regulatório,
+    funções cosméticas e restrições legais - nunca como fonte de dados
+    financeiros/comerciais (volumes, fornecedores, importação), que são
+    sempre atribuídos à base de comércio exterior correspondente. Cada
+    consulta é auditável:
     a chave de busca exata é hasheada em SHA256, e o dossiê consolidado separa
     claramente os Alertas Regulatórios (conformidade/uso permitido) dos Sinais
     Comerciais/Comex (oferta/importação), para que o Score Engine não confunda
@@ -40,11 +45,11 @@ class RegulatoryComexConnector:
         },
         "PT-PT": {
             "regulatory_body": "INFARMED (Autoridade Nacional do Medicamento e Produtos de Saúde, Portugal)",
-            "trade_source": "CosIng / ECHA (Regulamento (CE) 1223/2009, União Europeia)"
+            "trade_source": "Eurostat Comext / TARIC (dados de comércio exterior da União Europeia)"
         },
         "ES": {
             "regulatory_body": "AEMPS (Agencia Española de Medicamentos y Productos Sanitarios, España)",
-            "trade_source": "CosIng / ECHA (Reglamento (CE) 1223/2009, Unión Europea)"
+            "trade_source": "Eurostat Comext / TARIC (datos de comercio exterior de la Unión Europea)"
         }
     }
 
@@ -107,6 +112,31 @@ class RegulatoryComexConnector:
         "AT-035": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "10.0%", "alerts": ["Concentrações mais altas (uso dermatológico) tratadas como produto medicinal, fora do escopo do Regulamento (CE) 1223/2009"]},
     }
 
+    # Sobrescreve REGULATORY_REGISTRY para a jurisdição FDA (EUA), no mesmo
+    # padrão de EU_REGULATORY_OVERRIDES (mesmos ativos de maior sensibilidade
+    # regulatória). VALOR ILUSTRATIVO/MOCK PARA FINS DE PROTÓTIPO - assim como
+    # o restante desta base de conhecimento, não são valores oficiais
+    # consultados em tempo real nem orientação regulatória validada por
+    # especialista em regulação da FDA; requer validação por especialista
+    # antes de qualquer uso além deste protótipo auditável. Usado por
+    # get_regulatory_matrix() para compor a matriz regulatória por jurisdição.
+    FDA_REGULATORY_OVERRIDES = {
+        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A (sem teto percentual fixo sob o regime FD&C Act)", "alerts": ["Ácido glicirrízico sem limite numérico codificado pela FDA para cosméticos - avaliação via GRAS/relatórios de segurança do CIR"]},
+        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Precursores de hidroquinona sob escrutínio elevado da FDA para produtos de clareamento de pele"]},
+        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Ingredientes derivados de Cannabis sativa sob posição regulatória ainda não consolidada da FDA para uso cosmético"]},
+        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "N/A (sem teto percentual fixo; uso profissional avaliado por pH/formulação)", "alerts": []},
+        "AT-032": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "N/A (monografia OTC não aplicável a uso cosmético leave-on)", "alerts": []},
+        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem monografia OTC específica para uso tópico cosmético identificada - uso off-label"]},
+        "AT-035": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A", "alerts": ["Concentrações mais altas podem ser tratadas como produto OTC (monografia de acne), fora do escopo cosmético"]},
+    }
+
+    # Ranking de severidade usado para calcular o "máximo de severidade
+    # regulatória observado entre as jurisdições monitoradas" em
+    # get_regulatory_matrix() - mesma ordem implícita já usada por
+    # core.score_engine.calculate_regulatory_alert_level (DESCONHECIDO tratado
+    # como equivalente a MEDIO, não como pior caso automático).
+    _SEVERITY_RANK = {"NENHUM": 0, "BAIXO": 1, "MEDIO": 2, "DESCONHECIDO": 2, "ALTO": 3}
+
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
 
@@ -145,6 +175,45 @@ class RegulatoryComexConnector:
                 "alerts": [f"Falha ao consultar base regulatória: {e}"]
             }
 
+    def get_regulatory_matrix(self, asset_id: str) -> Dict[str, Any]:
+        """
+        Decompõe a severidade regulatória por jurisdição monitorada (Anvisa/
+        Brasil, Regulamento (CE) 1223/2009/UE, FDA/EUA - esta última mock/
+        ilustrativa, ver FDA_REGULATORY_OVERRIDES) e calcula o pior caso entre
+        as três, rotulado explicitamente como "Máximo de severidade
+        regulatória observado entre as jurisdições monitoradas". Diferente de
+        fetch_regulatory_status()/get_asset_dossier() (que retornam só a
+        jurisdição do idioma do relatório), este método sempre olha as 3
+        simultaneamente - usado por main.py para alimentar a árvore de
+        precedência (core/predictive_ranking.py) com o pior caso global, não
+        apenas o da jurisdição local do relatório.
+        """
+        fda_status = dict(self.FDA_REGULATORY_OVERRIDES.get(asset_id, self.REGULATORY_REGISTRY.get(asset_id, {
+            "status": "EM_ANALISE",
+            "restriction_level": "DESCONHECIDO",
+            "max_concentration_allowed": "N/A",
+            "alerts": ["Ativo não mapeado na base regulatória FDA (mock)"]
+        })))
+
+        jurisdictions = {
+            "ANVISA": self.fetch_regulatory_status(asset_id, lang="PT-BR"),
+            "EU_1223_2009": self.fetch_regulatory_status(asset_id, lang="PT-PT"),
+            "FDA": fda_status
+        }
+
+        max_source, max_status = max(
+            jurisdictions.items(),
+            key=lambda item: self._SEVERITY_RANK.get(item[1].get("restriction_level"), 0)
+        )
+
+        return {
+            "jurisdictions": jurisdictions,
+            "max_severity_level": max_status.get("restriction_level"),
+            "max_severity_source": max_source,
+            "max_severity_status": max_status,
+            "max_severity_label": "Máximo de severidade regulatória observado entre as jurisdições monitoradas"
+        }
+
     def fetch_import_volume_mock(self, hs_code: str, asset_id: str = None, lang: str = "PT-BR") -> Dict[str, Any]:
         """
         Simula a consulta de volumes de importação/suprimento via código NCM/HS,
@@ -167,13 +236,23 @@ class RegulatoryComexConnector:
             trend = ["DECRESCENTE", "ESTAVEL", "CRESCENTE"][int(seed[8:10], 16) % 3]
             volume_usd_annual = 150_000 + (int(seed[10:16], 16) % 2_000_000)
 
+            # C_trade (concentração observada nos fluxos comerciais do código NCM/HS)
+            # e V_unit-value (volatilidade do valor unitário declarado em alfândega):
+            # campos descritivos/aditivos, não usados em calculate_commercial_signal_level
+            # nem calculate_supply_risk (core/score_engine.py) - a lógica de risco já
+            # auditada nas rodadas anteriores continua baseada só em suppliers_count/trend.
+            c_trade_concentration = round(1 / suppliers_count, 3)
+            v_unit_value_volatility = round((int(seed[16:20], 16) % 100) / 100.0, 2)
+
             return {
                 "hs_code": hs_code,
                 "region": region_key,
                 "volume_usd_annual": volume_usd_annual,
                 "trend": trend,
                 "suppliers_count": suppliers_count,
-                "risk_score": "BAIXO_RISCO" if suppliers_count >= 5 else "MONITORAR"
+                "risk_score": "BAIXO_RISCO" if suppliers_count >= 5 else "MONITORAR",
+                "c_trade_concentration": c_trade_concentration,
+                "v_unit_value_volatility": v_unit_value_volatility
             }
         except Exception as e:
             return {
@@ -238,3 +317,11 @@ if __name__ == "__main__":
         print(f"[{lang}] Fonte comercial: {dossier['trade_source']}")
         print(f"[{lang}] Alertas regulatórios: {dossier['alertas_regulatorios']}")
         print(f"[{lang}] Query hash: {dossier['query_hash'][:16]}...")
+        commercial = comex_conn.fetch_import_volume_mock("2918.21.00", asset_id="AT-032", lang=lang)
+        print(f"[{lang}] C_trade (concentração): {commercial['c_trade_concentration']} | V_unit-value (volatilidade): {commercial['v_unit_value_volatility']}")
+
+    print("\n--- Matriz Regulatória Cross-Jurisdição (Anvisa/UE/FDA) - Cânhamo/CBD (AT-029) ---")
+    matrix = comex_conn.get_regulatory_matrix("AT-029")
+    for jurisdiction, status in matrix["jurisdictions"].items():
+        print(f"  {jurisdiction}: {status['restriction_level']} ({status['status']})")
+    print(f"  {matrix['max_severity_label']}: {matrix['max_severity_level']} (fonte: {matrix['max_severity_source']})")
