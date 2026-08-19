@@ -50,7 +50,7 @@ class PubMedConnector:
             if elapsed < self.MIN_REQUEST_INTERVAL:
                 time.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
 
-            req = urllib.request.Request(url, headers={'User-Agent': 'VanguardData/1.0'})
+            req = urllib.request.Request(url, headers={'User-Agent': 'ActivesPredict/1.0'})
             try:
                 with urllib.request.urlopen(req, timeout=self.REQUEST_TIMEOUT) as response:
                     self._last_request_at = time.monotonic()

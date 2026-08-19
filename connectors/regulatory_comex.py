@@ -4,6 +4,7 @@ import hashlib
 from typing import Dict, Any, Optional
 
 from core.entity_resolver import EntityResolver
+from connectors.trade_eurostat import TradeEurostatConnector
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -52,6 +53,14 @@ class RegulatoryComexConnector:
             "trade_source": "Eurostat Comext / TARIC (datos de comercio exterior de la Unión Europea)"
         }
     }
+
+    # Código de país declarante (reporter_code) OBRIGATÓRIO por idioma do
+    # relatório para consultas ao Eurostat Comext/TARIC (connectors/trade_eurostat.py)
+    # - CORREÇÃO: antes desta versão, PT-PT e ES compartilhavam o mesmo
+    # bucket regional genérico "EU" em fetch_import_volume_mock(), produzindo
+    # dados de comércio idênticos entre Portugal e Espanha. Cada idioma da
+    # UE agora resolve para seu próprio código de país declarante real.
+    LANG_TO_REPORTER_CODE = {"PT-PT": "PT", "ES": "ES"}
 
     # Base de conhecimento de status regulatórios (35 ativos dermocosméticos,
     # incluindo a classe de Ácidos Cosmecêuticos). Níveis atribuídos por
@@ -139,6 +148,7 @@ class RegulatoryComexConnector:
 
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
+        self.trade_eurostat = TradeEurostatConnector()
 
     @staticmethod
     def _query_hash(query: str) -> str:
@@ -216,22 +226,29 @@ class RegulatoryComexConnector:
 
     def fetch_import_volume_mock(self, hs_code: str, asset_id: str = None, lang: str = "PT-BR") -> Dict[str, Any]:
         """
-        Simula a consulta de volumes de importação/suprimento via código NCM/HS,
-        na base comercial da região correspondente ao idioma do relatório: Comex
-        Stat (Brasil) para PT-BR, ou a base de suprimento europeia (CosIng/ECHA,
-        harmonizada entre Portugal e Espanha) para PT-PT/ES. A contagem de
-        fornecedores e a tendência variam deterministicamente por ativo E por
-        região (mesmo ativo pode ter cadeia de suprimento com tamanho/tendência
-        diferente no Brasil vs. na UE), refletindo que a oferta real de mercado
-        não é global e homogênea. Resiliente: nunca propaga exceção - degrada
-        para um sinal neutro em vez de derrubar o pipeline.
+        Consulta os volumes de importação/suprimento via código NCM/HS, na
+        base comercial correspondente ao idioma do relatório: Comex Stat
+        (Brasil, mock local) para PT-BR; connectors.trade_eurostat.TradeEurostatConnector,
+        consultado com o reporter_code do país declarante específico do
+        mercado-alvo (LANG_TO_REPORTER_CODE - 'PT' para PT-PT, 'ES' para ES),
+        para PT-PT/ES. CORRIGIDO: antes, PT-PT e ES compartilhavam o mesmo
+        bucket regional genérico "EU", produzindo dados de comércio
+        IDÊNTICOS entre Portugal e Espanha - cada um agora resolve para seu
+        próprio país declarante real no Eurostat Comext/TARIC, garantindo
+        que os fornecedores/tendência/volume divirjam entre os dois
+        mercados (ver core/sanity_checks.py para a trava que audita essa
+        divergência). Resiliente: nunca propaga exceção - degrada para um
+        sinal neutro em vez de derrubar o pipeline.
         """
         if not hs_code:
             return {"hs_code": None, "volume_usd_annual": 0, "trend": "NEUTRO", "suppliers_count": 0, "risk_score": "DESCONHECIDO"}
 
+        reporter_code = self.LANG_TO_REPORTER_CODE.get(lang.upper())
+        if reporter_code:
+            return self.trade_eurostat.fetch_trade_data(hs_code, reporter_code=reporter_code, asset_id=asset_id)
+
         try:
-            region_key = "EU" if lang.upper() in ("PT-PT", "ES") else "BR"
-            seed = hashlib.sha256(f"{asset_id or hs_code}|{region_key}".encode("utf-8")).hexdigest()
+            seed = hashlib.sha256(f"{asset_id or hs_code}|BR".encode("utf-8")).hexdigest()
             suppliers_count = 1 + (int(seed[:8], 16) % 12)  # 1-12 fornecedores
             trend = ["DECRESCENTE", "ESTAVEL", "CRESCENTE"][int(seed[8:10], 16) % 3]
             volume_usd_annual = 150_000 + (int(seed[10:16], 16) % 2_000_000)
@@ -246,7 +263,7 @@ class RegulatoryComexConnector:
 
             return {
                 "hs_code": hs_code,
-                "region": region_key,
+                "region": "BR",
                 "volume_usd_annual": volume_usd_annual,
                 "trend": trend,
                 "suppliers_count": suppliers_count,

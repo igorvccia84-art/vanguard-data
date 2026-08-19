@@ -79,7 +79,7 @@ _PRODUCT_FORMULATION_PATTERN = _build_context_pattern(PRODUCT_FORMULATION_TERMS)
 
 class EntityResolver:
     """
-    Núcleo Auditável de Resolução de Entidades da Vanguard Data.
+    Núcleo Auditável de Resolução de Entidades da Actives Predict.
     Converte sinais brutos e heterogêneos de texto em registros de Ativo
     Canônico padronizados, aplicando regras de exclusão/negativa de busca
     para evitar contagem dupla e ruído fora da aplicação tópica/cosmética.

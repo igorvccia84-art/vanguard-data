@@ -1,6 +1,11 @@
 import sys
 import io
+import re
+import time
+import socket
 import hashlib
+import urllib.request
+import urllib.error
 from datetime import date, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -26,6 +31,17 @@ class PatentConnector:
 
     SEARCH_WINDOW_DAYS = 15  # janela de novidades exibida no relatório
     TRACTION_WINDOW_DAYS = 365  # janela histórica móvel usada para calcular Tração Industrial (core/score_engine.py)
+
+    # Validação determinística pré-relatório (mesmo princípio de rigor de
+    # connectors/pubmed_validator.py, aplicado a patentes): página pública
+    # canônica do Google Patents por número de publicação - não requer
+    # credenciais/OAuth (diferente do EPO OPS real, que exige registro de
+    # consumer key/secret ausente neste ambiente). Falha de rede/parse fecha
+    # para rejeição (fail-closed), nunca para aceitação.
+    GOOGLE_PATENTS_URL = "https://patents.google.com/patent/{patent_id}/en"
+    VALIDATION_TIMEOUT = 8  # segundos
+    VALIDATION_MAX_RETRIES = 2
+    _TITLE_TAG_PATTERN = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
 
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
@@ -173,6 +189,79 @@ class PatentConnector:
             "source": "EPO/WIPO",
             "entity_match": resolved_entity
         }
+
+    def validate_patent(self, patent_id: str, asset_canonical_name: str) -> Dict[str, Any]:
+        """
+        Validação determinística pré-relatório de um número de patente: busca
+        a página pública canônica do Google Patents (GOOGLE_PATENTS_URL) e
+        confirma programaticamente (a) que o documento existe (HTTP 200,
+        título extraído da página) e (b) que o título contém a entidade do
+        ativo pesquisado (Entity Resolution, core/entity_resolver.py).
+        SE A VALIDAÇÃO FALHAR (documento inexistente, timeout/erro de rede
+        após as tentativas, ou entidade não confirmada no título): retorna
+        valid=False - o chamador (main.py) deve remover estritamente o
+        patent_id do relatório. Nunca lança exceção (fail-closed).
+        """
+        last_error: Optional[str] = None
+        html: Optional[str] = None
+        url = self.GOOGLE_PATENTS_URL.format(patent_id=patent_id)
+
+        for attempt in range(self.VALIDATION_MAX_RETRIES):
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'ActivesPredict/1.0'})
+                with urllib.request.urlopen(req, timeout=self.VALIDATION_TIMEOUT) as response:
+                    html = response.read().decode('utf-8', errors='ignore')
+                break
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code}"
+                break  # 404/etc. não vale retry - o documento simplesmente não existe nesse número
+            except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+                last_error = str(e)
+                if attempt < self.VALIDATION_MAX_RETRIES - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+
+        if html is None:
+            return {
+                "patent_id": patent_id, "valid": False, "exists": False, "entity_confirmed": False,
+                "reason": f"Patente {patent_id} não pôde ser confirmada no Google Patents: {last_error}",
+                "title": ""
+            }
+
+        title_match = self._TITLE_TAG_PATTERN.search(html)
+        page_title = title_match.group(1).strip() if title_match else ""
+        exists = bool(page_title) and patent_id.upper() in html.upper()
+
+        if not exists:
+            return {
+                "patent_id": patent_id, "valid": False, "exists": False, "entity_confirmed": False,
+                "reason": f"Patente {patent_id} não encontrada no Google Patents (documento inexistente)",
+                "title": page_title
+            }
+
+        resolved_entity = self.resolver.resolve(page_title)
+        entity_confirmed = resolved_entity is not None
+
+        if not entity_confirmed:
+            return {
+                "patent_id": patent_id, "valid": False, "exists": True, "entity_confirmed": False,
+                "reason": f"Título da patente {patent_id} não confirma a entidade '{asset_canonical_name}'",
+                "title": page_title
+            }
+
+        return {"patent_id": patent_id, "valid": True, "exists": True, "entity_confirmed": True, "reason": None, "title": page_title}
+
+    def validate_patent_batch(self, patent_ids: List[str], asset_canonical_name: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """Valida uma lista de patent_ids (mesmo contrato de connectors.pubmed_validator.PMIDValidator.validate_batch)."""
+        valid_ids: List[str] = []
+        rejected: List[Dict[str, Any]] = []
+        for patent_id in patent_ids or []:
+            result = self.validate_patent(patent_id, asset_canonical_name)
+            if result["valid"]:
+                valid_ids.append(patent_id)
+            else:
+                rejected.append(result)
+        return valid_ids, rejected
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ DEFAULT_PRODUCT = {
 
 class DatabaseManager:
     """
-    Gerenciador de Persistência do Vanguard Data.
+    Gerenciador de Persistência da Actives Predict.
 
     Schema auditável e multi-nicho: cada execução do pipeline (pipeline_runs)
     fica associada a um domínio de mercado (market_domains) e a um produto de

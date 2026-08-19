@@ -18,7 +18,7 @@ COLOR_SOFT_RED = "#C0392B"
 
 SCHEMA_VERSION = "2.0.0"
 MODEL_VERSION = "2.0.0"
-BRAND_NAME = "Vanguard Data Intelligence"
+BRAND_NAME = "Actives Predict"
 SEARCH_WINDOW_DAYS = 15  # deve casar com connectors/pubmed.py e connectors/patents.py
 
 # Autoridade regulatória e fonte de dados comerciais/comex padrão por idioma do
@@ -215,7 +215,7 @@ DEFAULT_INNOVATION_RECOMMENDATION = {
 
 class PDFReportGenerator:
     """
-    Gerador do PhytoDemand Report (produto executivo da Vanguard Data).
+    Gerador do PhytoDemand Report (produto executivo da Actives Predict).
     Gera relatórios nos formatos HTML e PDF nos idiomas PT-BR, PT-PT e ES.
     Identidade visual: Verde Florestal (#1B4D3E) e Amarelo Dourado (#D4AF37) - sem azul.
 
@@ -237,7 +237,7 @@ class PDFReportGenerator:
         "PT-BR": {
             "title": "PhytoDemand Report",
             "document_classification": "Relatório Interno de Revisão Técnica e Metodológica",
-            "subtitle": "Protótipo Auditável de Priorização Estratégica baseado em Sinais Científicos, Industriais, Regulatórios e Comerciais",
+            "subtitle": "Protótipo Auditável de Priorização Estratégica",
             "asset_id": "ID do Ativo",
             "canonical_name": "Nome Canônico",
             "predictive_category": "Categoria de Triagem",
@@ -251,7 +251,7 @@ class PDFReportGenerator:
             "col_procurement": "Compras & Procurement",
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
-            "footer": "Relatório gerado automaticamente pela Plataforma Vanguard Data (Brasil)",
+            "footer": "Relatório gerado automaticamente pela Plataforma Actives Predict (Brasil)",
             "audit_title": "Período de Análise e Fontes de Dados",
             "audit_run_id": "ID de Execução (Run ID)",
             "audit_processed_at": "Data/Hora de Processamento",
@@ -273,7 +273,7 @@ class PDFReportGenerator:
         "PT-PT": {
             "title": "PhytoDemand Report",
             "document_classification": "Relatório Interno de Revisão Técnica e Metodológica",
-            "subtitle": "Protótipo Auditável de Priorização Estratégica baseado em Sinais Científicos, Industriais, Regulatórios e Comerciais",
+            "subtitle": "Protótipo Auditável de Priorização Estratégica",
             "asset_id": "ID do Ativo",
             "canonical_name": "Nome Canónico",
             "predictive_category": "Categoria de Triagem",
@@ -287,7 +287,7 @@ class PDFReportGenerator:
             "col_procurement": "Compras & Procurement",
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
-            "footer": "Relatório gerado automaticamente pela Plataforma Vanguard Data (Portugal)",
+            "footer": "Relatório gerado automaticamente pela Plataforma Actives Predict (Portugal)",
             "audit_title": "Período de Análise e Fontes de Dados",
             "audit_run_id": "ID de Execução (Run ID)",
             "audit_processed_at": "Data/Hora de Processamento",
@@ -309,7 +309,7 @@ class PDFReportGenerator:
         "ES": {
             "title": "PhytoDemand Report",
             "document_classification": "Informe Interno de Revisión Técnica y Metodológica",
-            "subtitle": "Prototipo Auditable de Priorización Estratégica basado en Señales Científicas, Industriales, Regulatorias y Comerciales",
+            "subtitle": "Prototipo Auditable de Priorización Estratégica",
             "asset_id": "ID del Activo",
             "canonical_name": "Nombre Canónico",
             "predictive_category": "Categoría de Triaje",
@@ -323,7 +323,7 @@ class PDFReportGenerator:
             "col_procurement": "Compras & Procurement",
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
-            "footer": "Informe generado automáticamente por la Plataforma Vanguard Data",
+            "footer": "Informe generado automáticamente por la Plataforma Actives Predict",
             "audit_title": "Período de Análisis y Fuentes de Datos",
             "audit_run_id": "ID de Ejecución (Run ID)",
             "audit_processed_at": "Fecha/Hora de Procesamiento",
@@ -776,8 +776,7 @@ class PDFReportGenerator:
 
     <div class="header">
         <h1>{t['title']}</h1>
-        <p class="document-classification">{t['document_classification']}</p>
-        <h2>{t['subtitle']}</h2>
+        <p class="document-classification">{t['document_classification']} &mdash; {t['subtitle']}</p>
     </div>
 
     <div class="audit-box">

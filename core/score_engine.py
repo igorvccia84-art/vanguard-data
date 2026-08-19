@@ -32,10 +32,40 @@ PROVISIONAL_WEIGHTS_DISCLAIMER = "Pesos provisórios, ainda não calibrados por 
 # Classificado": 1 único match é anedota, não sinal estatístico.
 MIN_VERIFIED_EVIDENCE = 2
 
+# Rótulos de jurisdição regulatória exibidos na Matriz Regulatória do PDF
+# (reports/pdf_generator.py), estritamente filtrados pelo target_market do
+# relatório - nunca a lista cheia de jurisdições monitoradas internamente por
+# connectors.regulatory_comex.get_regulatory_matrix() (que sempre calcula o
+# pior caso entre Anvisa/UE/FDA para fins de score, independente do mercado
+# do relatório). Evita vazamento de template (ex.: "Anvisa (Brasil)" num
+# relatório PT-PT/ES).
+_EU_COSMETICS_REGULATION_LABEL = "Regulamento (CE) 1223/2009 (UE)"
+MOCK_JURISDICTION_LABEL = "FDA (EUA, mock/ilustrativo)"
+
+MARKET_JURISDICTION_LABELS: Dict[str, List[str]] = {
+    "BR": ["Anvisa (Agência Nacional de Vigilância Sanitária, Brasil)"],
+    "PT": ["INFARMED (Autoridade Nacional do Medicamento e Produtos de Saúde, Portugal)", _EU_COSMETICS_REGULATION_LABEL],
+    "ES": ["AEMPS (Agencia Española de Medicamentos y Productos Sanitarios, España)", _EU_COSMETICS_REGULATION_LABEL],
+}
+
+
+def get_display_jurisdictions(target_market: str, include_mock: bool = False) -> List[str]:
+    """
+    Lista de jurisdições regulatórias a exibir na Matriz Regulatória do PDF
+    para um `target_market` específico ('BR', 'PT' ou 'ES') - nunca as
+    jurisdições de outros mercados. `include_mock=True` (só para ambientes de
+    teste explícitos - jamais em builds de exportação final) acrescenta a
+    jurisdição mock/ilustrativa da FDA ao final da lista.
+    """
+    labels = list(MARKET_JURISDICTION_LABELS.get((target_market or "").upper(), []))
+    if include_mock:
+        labels.append(MOCK_JURISDICTION_LABEL)
+    return labels
+
 
 class ScoreEngine:
     """
-    Motor de Cálculo de Score Decomposto da Vanguard Data.
+    Motor de Cálculo de Score Decomposto da Actives Predict.
     Substitui a caixa-preta por 3 pilares transparentes e auditáveis.
 
     Consome o dossiê refatorado do RegulatoryComexConnector
