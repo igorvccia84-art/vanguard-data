@@ -161,8 +161,13 @@ def main():
                 print(f"    [PMID] {asset_id} - {len(rejected_pmids)} PMID(s) rejeitado(s) na validação NCBI: {[r['pmid'] for r in rejected_pmids]}")
                 if _first_pmid_rejection is None:
                     _first_pmid_rejection = {"asset_id": asset_id, "canonical_name": canonical_name, **rejected_pmids[0]}
-            if verified_pmids and _first_pmid_success is None:
-                _first_pmid_success = {"asset_id": asset_id, "canonical_name": canonical_name, "pmid": verified_pmids[0]}
+            if verified_pmids:
+                # Trilha de auditoria explícita: todo PMID que chega ao relatório passou
+                # por aqui - sem esta linha, só as rejeições ficavam visíveis no console,
+                # dando a falsa impressão de que os PMIDs aceitos não tinham sido checados.
+                print(f"    [PMID] {asset_id} - {len(verified_pmids)} PMID(s) validado(s) e aceito(s) na NCBI: {verified_pmids}")
+                if _first_pmid_success is None:
+                    _first_pmid_success = {"asset_id": asset_id, "canonical_name": canonical_name, "pmid": verified_pmids[0]}
             if period_start is None:
                 period_start = pubmed_search["date_range"]["start"]
                 period_end = pubmed_search["date_range"]["end"]
