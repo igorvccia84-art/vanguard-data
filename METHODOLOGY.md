@@ -22,37 +22,49 @@ interpretação de cada score:
 |---|---|---|
 | PubMed (PMIDs, títulos, resumos) | **REAL** — NCBI E-utilities, chamada ao vivo | `connectors/pubmed.py`, `connectors/pubmed_validator.py` |
 | Patentes (números, títulos, assignees) | **MOCK/FABRICADO** — base embutida no código, nunca uma API real | `connectors/patents.py` `_mock_database()` |
-| Validação de patente citada no relatório (Google Patents) | **REAL** — só filtra o que é *exibido como citação*, ver limitação conhecida abaixo | `connectors/patents.py` `validate_patent()` |
+| Validação de patente (Google Patents) | **REAL** — filtra tanto o que é *exibido como citação* quanto o que *entra no cálculo de Tração Industrial* (corrigido em 2026-08-19, ver abaixo) | `connectors/patents.py` `validate_patent()` |
 | Comércio exterior (volume, fornecedores, tendência) | **MOCK determinístico** — sem credenciais de API configuradas (`.env`), nunca uma chamada real à Comex Stat/Eurostat | `connectors/regulatory_comex.py`, `connectors/trade_eurostat.py` |
 | Status regulatório (Anvisa/INFARMED/AEMPS/FDA) | **MOCK curado manualmente** — base de conhecimento no código, não uma consulta em tempo real | `connectors/regulatory_comex.py` `REGULATORY_REGISTRY` |
 
-## ⚠️ Limitação conhecida: Tração Industrial usa patentes NÃO validadas ao vivo
+## ✅ CORRIGIDO (2026-08-19): Tração Industrial agora só usa patentes validadas ao vivo
 
-**Achado desta auditoria (2026-08-19), ainda não corrigido no código:**
-a validação real de patentes via Google Patents (`patent_conn.validate_patent_batch`,
-chamada em `main.py` na Fase 3) hoje só filtra os `patent_ids` **exibidos como
-citação** no relatório (as tags "PAT: ..." ao lado de cada recomendação). Ela
-**não realimenta** o cálculo de Tração Industrial — esse score continua sendo
-calculado em cima de `_patent_traction_results`, que vem direto da base mock
-(`fetch_patents_mock`), sem nunca passar por `validate_patent()`.
+**Histórico do achado, para rastreabilidade da auditoria:** até 2026-08-19,
+a validação real de patentes via Google Patents (`patent_conn.validate_patent_batch`)
+só era chamada em `main.py` na Fase 3, e só filtrava os `patent_ids`
+**exibidos como citação** no relatório (as tags "PAT: ..." ao lado de cada
+recomendação) — **sem realimentar** o cálculo de Tração Industrial, que
+continuava sendo feito em cima de `_patent_traction_results` vindo direto da
+base mock (`fetch_patents_mock`), nunca passado por `validate_patent()`.
 
-Na prática, isso significa que o **número** "Tração Industrial: 8.0/10" pode
-aparecer no relatório mesmo quando **nenhuma** das patentes que o compõem
-sobrevive à checagem real no Google Patents — foi exatamente o que aconteceu
-com Chá Verde e Cúrcuma no rastro de cálculo do dia 2026-08-19 (ver documento
-linkado acima): as 2 patentes mock de cada ativo falharam a validação ao vivo
-(títulos reais de patentes reais, mas sobre assuntos completamente diferentes:
-vidro óptico, impressão jato de tinta), e mesmo assim os dois ativos exibem
-8.0/10 de Tração Industrial no PDF.
+Na prática, isso significava que o número "Tração Industrial: 8.0/10" podia
+aparecer no relatório mesmo quando **nenhuma** das patentes que o compunham
+sobrevivia à checagem real no Google Patents — foi exatamente o que aconteceu
+com Chá Verde e Cúrcuma no rastro de cálculo capturado nesse dia (ver
+[`docs/calculation_trace_2026-08-19.md`](docs/calculation_trace_2026-08-19.md),
+histórico "antes da correção"): as 2 patentes mock de cada ativo falharam a
+validação ao vivo (títulos reais de patentes reais, mas sobre assuntos
+completamente diferentes — vidro óptico, impressão jato de tinta), e mesmo
+assim os dois ativos exibiam 8.0/10 de Tração Industrial no PDF.
 
-Isso não é uma falha da validação em si (ela funciona corretamente e é
-honesta sobre suas próprias rejeições) — é uma lacuna de integração: o
-resultado da validação não propaga de volta para o score. Corrigir isso
-exigiria recalcular `tracao_industrial` a partir de `patent_ids` (já
-validados) em vez de `_patent_traction_results` (mock bruto), o que por sua
-vez tende a zerar a Tração Industrial de praticamente todos os ativos
-selecionados hoje, já que a base de patentes inteira é fabricada e não
-corresponde a nenhuma patente real sobre o ativo em questão.
+**Correção aplicada:** `main.py` (Fase 1) agora chama
+`patent_conn.validate_patent_batch()` sobre os resultados da busca de
+patentes de tração (12 meses) **antes** de montar `_patent_traction_results`,
+e filtra para conter só as patentes que passaram na validação ao vivo. Tanto
+`tracao_industrial` quanto `confianca_sinal` (que também soma `patent_data`
+em `calculate_confidence_level`) agora derivam estritamente de evidência
+confirmada — a validação da Fase 3 (citação exibida) tornou-se redundante e
+foi removida, já que `item["patent_ids"]` chega pré-validado da Fase 1.
+
+**Efeito colateral esperado e confirmado** (rastro pós-correção, mesmo
+comando `python scripts/calculation_trace.py AT-009 AT-015`): como toda a
+base de patentes (`connectors/patents.py` `_mock_database()`) é fabricada e
+não corresponde a nenhuma patente real sobre os ativos do catálogo, a
+Tração Industrial de Chá Verde e Cúrcuma caiu de 8.0/10 para **0.0/10** — e
+o mesmo deve se repetir para a maioria/totalidade dos demais ativos em
+execuções futuras, até que `connectors/patents.py` seja substituído por uma
+fonte real de dados de patentes (EPO OPS ou equivalente, com credenciais).
+Isso é o comportamento CORRETO diante da regra "nenhuma citação/score pode
+depender de dado fabricado" — não é uma regressão.
 
 ## 1. Tração Científica (T_c)
 

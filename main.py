@@ -192,17 +192,47 @@ def main():
             )
 
             # Patentes: aplica exclusões, restringe à janela de 15 dias (publication_date), deduplica
-            # por família de patentes, recebe resultados + query_hash
+            # por família de patentes, recebe resultados + query_hash. patent_conn.fetch_patents_mock()
+            # é uma base MOCK/fabricada (ver METHODOLOGY.md) - por isso todo patent_id candidato passa
+            # pela mesma validação determinística obrigatória pré-relatório usada para PMIDs
+            # (patent_conn.validate_patent_batch, Google Patents ao vivo) ANTES de entrar em
+            # 'patent_ids' (citação exibida no relatório). Só patentes reais e que confirmam a
+            # entidade do ativo chegam ao relatório - nenhuma citação de patente mock/fabricada.
             patent_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions)
-            patent_results = [patent_conn.process_patent(p) for p in patent_search["results"]]
+            valid_patent_ids, rejected_patent_ids = patent_conn.validate_patent_batch(
+                [p["patent_id"] for p in patent_search["results"]], canonical_name
+            )
+            if rejected_patent_ids:
+                print(f"    [PAT] {asset_id} - {len(rejected_patent_ids)} patente(s) rejeitada(s) na validação: {[r['patent_id'] for r in rejected_patent_ids]}")
+            if valid_patent_ids:
+                print(f"    [PAT] {asset_id} - {len(valid_patent_ids)} patente(s) validada(s) e aceita(s): {valid_patent_ids}")
 
             # Patentes (Tração): mesma janela histórica móvel de 12 meses, para Tração Industrial.
             # Patentes estão sujeitas à defasagem legal entre depósito e publicação - a janela de
             # 12 meses é mais representativa da proteção industrial real do que a de 15 dias.
+            #
+            # IMPORTANTE (achado de auditoria corrigido nesta versão): até aqui, a Tração Industrial
+            # era calculada em cima de TODAS as patentes mock retornadas por fetch_patents_mock(),
+            # mesmo as que a validação real via Google Patents rejeitaria - a validação só filtrava
+            # o que era EXIBIDO como citação, nunca realimentava o score (ver METHODOLOGY.md,
+            # "Limitação conhecida"). Agora patent_traction_results só inclui patentes que passaram
+            # pela MESMA validação ao vivo aplicada acima - o score deriva estritamente de evidência
+            # confirmada, nunca de dado mock não verificado.
             patent_traction_search = patent_conn.fetch_patents_mock(
                 search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS
             )
-            patent_traction_results = [patent_conn.process_patent(p) for p in patent_traction_search["results"]]
+            valid_traction_patent_ids, rejected_traction_patents = patent_conn.validate_patent_batch(
+                [p["patent_id"] for p in patent_traction_search["results"]], canonical_name
+            )
+            if rejected_traction_patents:
+                print(f"    [PAT-T_i] {asset_id} - {len(rejected_traction_patents)} patente(s) de tração (12m) rejeitada(s), NÃO entram em T_i: {[r['patent_id'] for r in rejected_traction_patents]}")
+            if valid_traction_patent_ids:
+                print(f"    [PAT-T_i] {asset_id} - {len(valid_traction_patent_ids)} patente(s) de tração (12m) validada(s), entram em T_i: {valid_traction_patent_ids}")
+            valid_traction_ids_set = set(valid_traction_patent_ids)
+            patent_traction_results = [
+                patent_conn.process_patent(p) for p in patent_traction_search["results"]
+                if p["patent_id"] in valid_traction_ids_set
+            ]
 
             # Regulatório/Comex: dossiê consolidado - Alertas Regulatórios e Sinais Comerciais/Comex + query_hash.
             # Jurisdição baseline PT-BR (Anvisa) usada para o dossiê comercial (R_trade permanece
@@ -308,7 +338,7 @@ def main():
                 "pubmed_raw_count_12m": pubmed_traction_search["count"],
                 "tem_exclusoes": bool(exclusions),
                 "pmids": verified_pmids,
-                "patent_ids": [p["patent_id"] for p in patent_search["results"]],
+                "patent_ids": valid_patent_ids,
                 "hs_code": hs_code,
                 "pubmed_baseline_count": pubmed_baseline_search["count"],
                 "_pubmed_traction_results": pubmed_traction_results,
@@ -395,16 +425,10 @@ def main():
             )
             print(f"   🤖 Resumo: {evidence_summary[:90]}...")
 
-            # Validação determinística pré-relatório dos números de patente
-            # citáveis deste ativo (equivalente ao gate de PMIDs, aplicado a
-            # patentes via Google Patents - connectors/patents.py.validate_patent_batch).
-            # Qualquer patent_id que não exista de fato ou cuja página não
-            # confirme a entidade do ativo é removido antes de chegar à LLM
-            # ou ao PDF.
-            _valid_patent_ids, _rejected_patents = patent_conn.validate_patent_batch(item["patent_ids"], canonical_name)
-            if _rejected_patents:
-                print(f"   [PAT] {asset_id} - {len(_rejected_patents)} patente(s) rejeitada(s) na validação: {[r['patent_id'] for r in _rejected_patents]}")
-            item["patent_ids"] = _valid_patent_ids
+            # item["patent_ids"] e item["_patent_traction_results"] já vêm validados
+            # ao vivo (Google Patents) desde a Fase 1 - tanto a Tração Industrial
+            # quanto as citações exibidas no relatório derivam só de patentes reais
+            # e confirmadas, nunca da base mock bruta (ver METHODOLOGY.md).
 
             # Trava determinística pós-LLM (core/llm_analysis.py): tier real do ativo
             # (não o predictive_category exibido, que pode vir do preenchimento de

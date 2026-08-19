@@ -90,7 +90,16 @@ def main():
 
     patent_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions)
     patent_traction_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS)
-    patent_traction_results = [patent_conn.process_patent(p) for p in patent_traction_search["results"]]
+    # Tração Industrial só conta patentes validadas ao vivo (Google Patents) - mesma
+    # correção aplicada em main.py Fase 1 (ver METHODOLOGY.md).
+    valid_traction_ids, _ = patent_conn.validate_patent_batch(
+        [p["patent_id"] for p in patent_traction_search["results"]], canonical_name
+    )
+    valid_traction_ids_set = set(valid_traction_ids)
+    patent_traction_results = [
+        patent_conn.process_patent(p) for p in patent_traction_search["results"]
+        if p["patent_id"] in valid_traction_ids_set
+    ]
 
     dossier = comex_conn.get_asset_dossier(asset_id, hs_code=hs_code, lang=LANG)
     regulatory_matrix = comex_conn.get_regulatory_matrix(asset_id)

@@ -94,20 +94,24 @@ def trace_asset(asset_id: str, resolver, pubmed_conn, patent_conn, comex_conn, s
         em = processed.get("entity_match")
         print(f"    Entity Resolution LOCAL (contra o próprio título mock): {'match' if em else 'sem match'}"
               + (f" (confidence_score={em.get('confidence_score')})" if em else ""))
-        # Validação real ao vivo contra o Google Patents - mostra explicitamente
-        # que ESTE resultado NÃO é usado para recalcular T_i (ver nota abaixo).
+        # Validação real ao vivo contra o Google Patents - desde a correção de
+        # 2026-08-19 (ver METHODOLOGY.md), este resultado É o que decide se a
+        # patente entra ou não na fórmula de T_i (não é mais só cosmético).
         live = patent_conn.validate_patent(pid, canonical_name)
         print(f"    Validação AO VIVO no Google Patents ({gp_link}): valid={live['valid']}"
               + (f" -> {live['reason']}" if not live["valid"] else " (existe e confirma a entidade)"))
 
-    n_patents_feeding_score = len(patent_traction_results)
-    n_patents_live_validated = sum(1 for p in patent_traction_results if patent_conn.validate_patent(p["patent_id"], canonical_name)["valid"])
-    print(f"\nPatentes que efetivamente entram na fórmula de T_i (mock, SEM checagem ao vivo): {n_patents_feeding_score}")
-    print(f"Dessas, quantas sobreviveriam à validação ao vivo no Google Patents: {n_patents_live_validated}")
-    if n_patents_feeding_score != n_patents_live_validated:
-        print("  >>> GAP CONFIRMADO: T_i é calculada sobre patentes que a validação ao vivo REJEITARIA.")
-        print("  >>> A validação ao vivo (connectors/patents.py.validate_patent_batch, chamada em main.py Fase 3)")
-        print("  >>> hoje só filtra os patent_ids EXIBIDOS como citação no relatório - NÃO recalcula T_i.")
+    valid_patent_ids_live = {
+        p["patent_id"] for p in patent_traction_results
+        if patent_conn.validate_patent(p["patent_id"], canonical_name)["valid"]
+    }
+    n_patents_mock_total = len(patent_traction_results)
+    n_patents_feeding_score = len(valid_patent_ids_live)
+    # CORRIGIDO (2026-08-19): T_i agora é calculada só com as patentes que sobrevivem
+    # à validação ao vivo - filtra ANTES de chamar generate_assessment(), igual ao
+    # main.py em produção (ver METHODOLOGY.md, "Limitação conhecida" - histórico).
+    patent_traction_results = [p for p in patent_traction_results if p["patent_id"] in valid_patent_ids_live]
+    print(f"\nPatentes mock retornadas pela busca: {n_patents_mock_total} | Validadas ao vivo (entram em T_i): {n_patents_feeding_score}")
 
     # ---- 4. Comércio Exterior (MOCK, nunca uma API real neste ambiente) ----
     print("\n--- [4] Comércio Exterior / Regulatório (usado em Risco de Oferta e Confiança) ---")
@@ -147,7 +151,7 @@ def trace_asset(asset_id: str, resolver, pubmed_conn, patent_conn, comex_conn, s
     print(f"  = {breakdown['weights']['V']}*{breakdown['components']['V']} + {breakdown['weights']['G']}*{breakdown['components']['G']}"
           f" + {breakdown['weights']['A']}*{breakdown['components']['A']} + {breakdown['weights']['Q']}*{breakdown['components']['Q']}")
     print(f"\nTRAÇÃO INDUSTRIAL FINAL: {assessment['tracao_industrial']}"
-          f"  (derivada de {n_patents_feeding_score} patentes MOCK, não validadas ao vivo - ver [3] acima)")
+          f"  (derivada de {n_patents_feeding_score} patente(s) validada(s) ao vivo no Google Patents - ver [3] acima)")
     print(f"\nRISCO DE OFERTA: {assessment['risco_oferta']}  (Alerta Regulatório={assessment['alerta_regulatorio']}, Sinal Comercial={assessment['sinal_comercial_comex']})")
     print(f"CONFIANÇA DO SINAL: {assessment['confianca_sinal']}")
     print(f"Evidências verificadas (PubMed verificado + patentes com match local): {assessment['evidencias_verificadas']}")
@@ -157,7 +161,7 @@ def trace_asset(asset_id: str, resolver, pubmed_conn, patent_conn, comex_conn, s
         "pmids_verified": [d["pmid"] for d in traction_results if d.get("entity_match")],
         "baseline_36m_count": baseline_search["count"],
         "patents_feeding_score": [p["patent_id"] for p in patent_traction_results],
-        "patents_live_valid_count": n_patents_live_validated,
+        "patents_live_valid_count": n_patents_feeding_score,
         "commercial_raw": commercial,
         "assessment": assessment
     }
