@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import anthropic
 
 from core.formatting import format_usd_estimate
+from core.predictive_ranking import MIN_SCI_FOR_EMERGING_STAR, MIN_IND_FOR_EMERGING_STAR
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -304,8 +305,18 @@ def _default_supply_recommendation(risco_oferta: str, lang_key: str) -> str:
 
 
 def _default_innovation_recommendation(assessment: Dict[str, Any], lang_key: str) -> str:
-    combined = _parse_score_value(assessment.get("tracao_cientifica")) + _parse_score_value(assessment.get("tracao_industrial"))
-    tier = "alta" if combined >= 10 else "media" if combined >= 4 else "baixa"
+    sci = _parse_score_value(assessment.get("tracao_cientifica"))
+    ind = _parse_score_value(assessment.get("tracao_industrial"))
+    # "alta" exige piso mínimo em CADA componente (mesma regra e mesmo
+    # motivo de core.predictive_ranking.classify_precedence_tier - um
+    # componente zerado nunca deveria produzir uma recomendação de
+    # prioridade "alta" só porque o outro está saturado; corrigido em
+    # 2026-08-19 junto com o tier "Estrela Emergente").
+    if sci >= MIN_SCI_FOR_EMERGING_STAR and ind >= MIN_IND_FOR_EMERGING_STAR:
+        tier = "alta"
+    else:
+        combined = sci + ind
+        tier = "media" if combined >= 4 else "baixa"
     table = _DEFAULT_INNOVATION_RECOMMENDATION.get(lang_key, _DEFAULT_INNOVATION_RECOMMENDATION["PT-BR"])
     return table[tier]
 

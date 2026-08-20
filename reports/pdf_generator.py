@@ -6,6 +6,11 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
+from core.predictive_ranking import (
+    MIN_SCI_FOR_EMERGING_STAR, MIN_IND_FOR_EMERGING_STAR,
+    CATEGORY_HIGH_RISK, CATEGORY_EMERGING_STARS, CATEGORY_DARK_HORSES,
+)
+
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
@@ -251,6 +256,7 @@ class PDFReportGenerator:
             "col_procurement": "Compras & Procurement",
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
+            "col_evidence_reg": "REG",
             "footer": "Relatório gerado automaticamente pela Plataforma Actives Predict (Brasil)",
             "audit_title": "Período de Análise e Fontes de Dados",
             "audit_run_id": "ID de Execução (Run ID)",
@@ -268,7 +274,10 @@ class PDFReportGenerator:
             "weights_disclaimer": "Pesos provisórios, ainda não calibrados por validação externa/backtesting.",
             "regulatory_matrix_title": "Matriz Regulatória por Jurisdição",
             "regulatory_matrix_max_severity": "Máximo de severidade regulatória observado entre as jurisdições monitoradas",
-            "methodology_title": "Legenda Metodológica das Categorias de Triagem"
+            "methodology_title": "Legenda Metodológica das Categorias de Triagem",
+            "no_qualifying_assets_note": "Nenhum ativo qualificado nesta categoria no período analisado",
+            "no_assets_at_all": "Nenhum ativo do catálogo qualificou genuinamente para nenhuma categoria de triagem no período analisado.",
+            "regulatory_verified_on": "verificado em"
         },
         "PT-PT": {
             "title": "PhytoDemand Report",
@@ -287,6 +296,7 @@ class PDFReportGenerator:
             "col_procurement": "Compras & Procurement",
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
+            "col_evidence_reg": "REG",
             "footer": "Relatório gerado automaticamente pela Plataforma Actives Predict (Portugal)",
             "audit_title": "Período de Análise e Fontes de Dados",
             "audit_run_id": "ID de Execução (Run ID)",
@@ -304,7 +314,10 @@ class PDFReportGenerator:
             "weights_disclaimer": "Pesos provisórios, ainda não calibrados por validação externa/backtesting.",
             "regulatory_matrix_title": "Matriz Regulatória por Jurisdição",
             "regulatory_matrix_max_severity": "Máximo de severidade regulatória observado entre as jurisdições monitoradas",
-            "methodology_title": "Legenda Metodológica das Categorias de Triagem"
+            "methodology_title": "Legenda Metodológica das Categorias de Triagem",
+            "no_qualifying_assets_note": "Nenhum ativo qualificado nesta categoria no período analisado",
+            "no_assets_at_all": "Nenhum ativo do catálogo qualificou genuinamente para nenhuma categoria de triagem no período analisado.",
+            "regulatory_verified_on": "verificado em"
         },
         "ES": {
             "title": "PhytoDemand Report",
@@ -323,6 +336,7 @@ class PDFReportGenerator:
             "col_procurement": "Compras & Procurement",
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
+            "col_evidence_reg": "REG",
             "footer": "Informe generado automáticamente por la Plataforma Actives Predict",
             "audit_title": "Período de Análisis y Fuentes de Datos",
             "audit_run_id": "ID de Ejecución (Run ID)",
@@ -340,7 +354,10 @@ class PDFReportGenerator:
             "weights_disclaimer": "Pesos provisionales, aún no calibrados por validación externa/backtesting.",
             "regulatory_matrix_title": "Matriz Regulatoria por Jurisdicción",
             "regulatory_matrix_max_severity": "Máximo de severidad regulatoria observado entre las jurisdicciones monitoreadas",
-            "methodology_title": "Leyenda Metodológica de las Categorías de Triaje"
+            "methodology_title": "Leyenda Metodológica de las Categorías de Triaje",
+            "no_qualifying_assets_note": "Ningún activo calificado en esta categoría en el período analizado",
+            "no_assets_at_all": "Ningún activo del catálogo calificó genuinamente para ninguna categoría de triaje en el período analizado.",
+            "regulatory_verified_on": "verificado el"
         }
     }
 
@@ -380,8 +397,17 @@ class PDFReportGenerator:
             except (ValueError, AttributeError, IndexError, TypeError):
                 return 0.0
 
-        combined = _parse_score(item.get("scientific_traction")) + _parse_score(item.get("industrial_traction"))
-        tier = "alta" if combined >= 10 else "media" if combined >= 4 else "baixa"
+        sci = _parse_score(item.get("scientific_traction"))
+        ind = _parse_score(item.get("industrial_traction"))
+        # "alta" exige piso mínimo em CADA componente (mesma regra de
+        # core.predictive_ranking.classify_precedence_tier - corrigido em
+        # 2026-08-19 junto com o tier "Estrela Emergente": um componente
+        # zerado nunca deveria produzir "alta" só porque o outro satura).
+        if sci >= MIN_SCI_FOR_EMERGING_STAR and ind >= MIN_IND_FOR_EMERGING_STAR:
+            tier = "alta"
+        else:
+            combined = sci + ind
+            tier = "media" if combined >= 4 else "baixa"
         table = DEFAULT_INNOVATION_RECOMMENDATION.get(lang_key, DEFAULT_INNOVATION_RECOMMENDATION["PT-BR"])
         return table[tier]
 
@@ -406,7 +432,9 @@ class PDFReportGenerator:
         Alerta Regulatório de CADA ativo da tabela (que já reflete o pior
         caso entre elas, ver main.py + connectors.regulatory_comex.get_regulatory_matrix())
         - é uma nota metodológica de nível de relatório, não uma matriz por
-        ativo individual (o relatório cobre 8 ativos diferentes). Se omitido,
+        ativo individual (o relatório cobre um número dinâmico de ativos -
+        só os que genuinamente qualificam em cada categoria, ver
+        core/predictive_ranking.py select_predictive_assets()). Se omitido,
         a seção não é exibida (uso standalone deste módulo).
         """
         t = self.TRANSLATIONS.get(lang.upper(), self.TRANSLATIONS["PT-BR"])
@@ -430,6 +458,26 @@ class PDFReportGenerator:
                 <div class="audit-value">{jurisdictions_monitored}</div>
             </div>
             """
+
+        # Número de ativos exibidos é DINÂMICO desde 2026-08-19 - só os que
+        # genuinamente qualificam em cada categoria (core/predictive_ranking.py
+        # select_predictive_assets(), sem preenchimento artificial até um
+        # total fixo - ver METHODOLOGY.md, "Preenchimento fabricado
+        # removido"). Uma categoria sem NENHUM ativo qualificado nesta
+        # execução simplesmente não gera linha de tabela nenhuma - nunca uma
+        # linha fabricada; a ausência é comunicada por texto explícito
+        # (no_qualifying_assets_note/no_assets_at_all), não por uma entrada
+        # de tabela disfarçada.
+        categories_present = {item.get("predictive_category") for item in evaluations}
+        missing_category_labels = [
+            PREDICTIVE_CATEGORY_LABELS.get(lang.upper(), {}).get(cat_key, cat_key)
+            for cat_key in (CATEGORY_HIGH_RISK, CATEGORY_EMERGING_STARS, CATEGORY_DARK_HORSES)
+            if cat_key not in categories_present
+        ]
+        no_qualifying_assets_html = (
+            f'<p class="methodology-disclaimer">{t["no_qualifying_assets_note"]}: {", ".join(missing_category_labels)}.</p>'
+            if missing_category_labels and evaluations else ""
+        )
 
         rows_html = ""
         for item in evaluations:
@@ -482,6 +530,15 @@ class PDFReportGenerator:
                 f'<span class="evidence-tag">{t["col_evidence_pat"]}: {self._format_patent_id(p)}</span>'
                 for p in item.get("patent_ids", []) or []
             )
+            # Rastreabilidade regulatória (obrigatória em toda entrada de
+            # connectors/regulatory_comex.py, ver RegulatoryRegistryTraceabilityError)
+            # exposta como evidence-tag - só para ativos cuja categoria de
+            # triagem é de fato "High-Risk / Supply Alert", para não poluir
+            # toda linha da tabela com uma fonte regulatória que não influenciou
+            # a categorização daquele ativo.
+            if item.get("predictive_category") == CATEGORY_HIGH_RISK and item.get("regulatory_source"):
+                verified = item.get("regulatory_last_verified") or "N/A"
+                evidence_tags += f'<span class="evidence-tag">{t["col_evidence_reg"]}: {item["regulatory_source"]} ({t["regulatory_verified_on"]} {verified})</span>'
             evidence_html = f'<div class="evidence-refs">{evidence_tags}</div>' if evidence_tags else ""
 
             recommendation_rows_html += f"""
@@ -799,7 +856,7 @@ class PDFReportGenerator:
         {f'<p class="methodology-disclaimer">{t["regulatory_matrix_max_severity"]}.</p>' if regulatory_matrix else ''}
     </div>
 
-    <table>
+    {f'''<table>
         <thead>
             <tr>
                 <th>{t['asset_id']}</th>
@@ -814,7 +871,8 @@ class PDFReportGenerator:
         <tbody>
             {rows_html}
         </tbody>
-    </table>
+    </table>''' if evaluations else f'<p class="methodology-disclaimer">{t["no_assets_at_all"]}</p>'}
+    {no_qualifying_assets_html}
 
     <div class="methodology-box">
         <h4>{t['methodology_title']}</h4>

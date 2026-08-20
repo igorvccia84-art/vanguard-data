@@ -20,6 +20,9 @@ ENV/
 *.sqlite
 *.sqlite3
 
+# Cache de conectores externos (EPO OPS, etc.) - dado transitório, não fonte
+data/cache/
+
 # Generated reports (build artifacts, not source)
 reports/output/
 

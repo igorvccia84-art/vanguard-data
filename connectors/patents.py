@@ -1,12 +1,17 @@
 import sys
 import io
 import re
+import os
 import time
 import socket
+import base64
 import hashlib
+import json
 import urllib.request
+import urllib.parse
 import urllib.error
-from datetime import date, timedelta
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
 from core.entity_resolver import EntityResolver
@@ -16,28 +21,73 @@ if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 
+class ConnectorRequestError(RuntimeError):
+    """Falha de requisição ao EPO OPS (timeout, erro de rede ou HTTP) após esgotar as tentativas de retry."""
+
+
+class PatentConnectorConfigError(RuntimeError):
+    """EPO_OPS_CONSUMER_KEY/EPO_OPS_CONSUMER_SECRET ausentes ou incompletos em .env - erro de configuração, nunca uma falha transitória de rede (não deve ser mascarado como 'zero patentes encontradas')."""
+
+
 class PatentConnector:
     """
-    Conector independente para dados de Patentes (EPO/WIPO).
-    Consome depósitos de patentes, deduplica por família de patentes (várias
-    jurisdições - EP/WO/US/CN/... - frequentemente protegem a mesma invenção e
-    não devem ser contadas como sinais industriais independentes) e enriquece
-    com Entity Resolution. Cada busca é auditável: os termos de busca/exclusão
-    aplicados e o hash SHA256 da query exata são retornados junto aos resultados.
-    A busca é restrita à janela dos últimos SEARCH_WINDOW_DAYS dias (data de
-    publicação/evento mais recente da patente) em relação à data atual, para
-    que o relatório reflita sinais industriais recentes de mercado.
+    Conector independente para dados de Patentes.
+
+    fetch_patents() é o ponto de entrada de produção: busca REAL no EPO OPS
+    (Open Patent Services, https://ops.epo.org) via OAuth2 client-credentials
+    + CQL (Contextual Query Language), com rate-limit/backoff e cache em
+    disco de 14 dias. Deduplica por família de patentes (várias jurisdições -
+    EP/WO/US/CN/... - frequentemente protegem a mesma invenção e não devem
+    ser contadas como sinais industriais independentes, usando o INPADOC
+    family-id retornado pelo próprio OPS) e enriquece com Entity Resolution.
+    Cada busca é auditável: a query CQL exata e seu hash SHA256 são
+    retornados junto aos resultados. A busca é restrita à janela dos últimos
+    SEARCH_WINDOW_DAYS dias (data de publicação) em relação à data atual,
+    para que o relatório reflita sinais industriais recentes de mercado.
+
+    fetch_patents_mock() permanece disponível separadamente, só para
+    desenvolvimento/teste offline sem credenciais - nunca é usada
+    implicitamente por fetch_patents() (ver PatentConnectorConfigError).
     """
 
     SEARCH_WINDOW_DAYS = 15  # janela de novidades exibida no relatório
     TRACTION_WINDOW_DAYS = 365  # janela histórica móvel usada para calcular Tração Industrial (core/score_engine.py)
 
+    # --- EPO OPS (Open Patent Services) - conector real (OAuth2 + CQL) ---
+    # Endpoints e comportamento confirmados por chamada ao vivo durante o
+    # desenvolvimento deste conector (não apenas pela documentação):
+    #   - OPS aceita no máximo 1 operador NOT por query (erro
+    #     CLIENT.NotOperatorMaxNumber acima disso) - por isso todas as
+    #     exclusões do ativo são agrupadas numa única cláusula
+    #     'not (ab="x" or ab="y" ...)' em vez de um NOT por termo.
+    #   - "ANDNOT" (um único token) NÃO é um operador CQL válido no OPS -
+    #     resulta silenciosamente em zero resultados. O operador correto é
+    #     "not" (equivale a AND NOT em CQL padrão).
+    #   - Ausência de resultados retorna HTTP 404 com fault
+    #     SERVER.EntityNotFound - tratado como resposta válida (zero
+    #     patentes), nunca como falha de conector.
+    OPS_TOKEN_URL = "https://ops.epo.org/3.2/auth/accesstoken"
+    OPS_SEARCH_URL = "https://ops.epo.org/3.2/rest-services/published-data/search/biblio"
+    OPS_MIN_REQUEST_INTERVAL = 1.0  # segundos entre requisições (fair-use; ver header x-throttling-control da resposta)
+    OPS_MAX_RETRIES = 3
+    OPS_REQUEST_TIMEOUT = 20  # segundos
+    OPS_MAX_RESULTS = 25  # tamanho de página (header Range) por busca
+    OPS_TOKEN_EXPIRY_BUFFER = 60  # segundos de margem antes do expires_in reportado pelo token OAuth2
+    _NS = {"ops": "http://ops.epo.org", "ex": "http://www.epo.org/exchange"}
+    _IPC_TEXT_PATTERN = re.compile(r'([A-H]\d{2}[A-Z])\D*(\d{1,4})\D*/\D*(\d{1,6})')
+
+    # Cache em disco de resultados de busca EPO OPS - reexecuções da mesma
+    # query CQL (mesmos termos + mesma janela de datas) dentro de
+    # CACHE_TTL_DAYS não geram nova chamada de rede/consumo de quota.
+    CACHE_DIR = os.path.join("data", "cache", "epo_ops")
+    CACHE_TTL_DAYS = 14
+
     # Validação determinística pré-relatório (mesmo princípio de rigor de
     # connectors/pubmed_validator.py, aplicado a patentes): página pública
-    # canônica do Google Patents por número de publicação - não requer
-    # credenciais/OAuth (diferente do EPO OPS real, que exige registro de
-    # consumer key/secret ausente neste ambiente). Falha de rede/parse fecha
-    # para rejeição (fail-closed), nunca para aceitação.
+    # canônica do Google Patents por número de publicação, como camada
+    # independente de confirmação sobre o resultado já real do EPO OPS.
+    # Falha de rede/parse fecha para rejeição (fail-closed), nunca para
+    # aceitação.
     GOOGLE_PATENTS_URL = "https://patents.google.com/patent/{patent_id}/en"
     VALIDATION_TIMEOUT = 8  # segundos
     VALIDATION_MAX_RETRIES = 2
@@ -45,6 +95,10 @@ class PatentConnector:
 
     def __init__(self, resolver: EntityResolver):
         self.resolver = resolver
+        self._access_token: Optional[str] = None
+        self._token_expires_at: float = 0.0
+        self._last_ops_request_at: float = 0.0
+        os.makedirs(self.CACHE_DIR, exist_ok=True)
 
     def _mock_database(self) -> List[Dict[str, Any]]:
         """
@@ -101,6 +155,17 @@ class PatentConnector:
         """SHA256 da query exata de busca, para rastreabilidade em evaluation_evidence_sources."""
         return hashlib.sha256(query.encode('utf-8')).hexdigest()
 
+    @staticmethod
+    def _dedupe_by_family(patents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Deduplica por family_id, mantendo o depósito mais antigo (menor filing_year) como representante de cada família. Usado tanto pela base mock quanto pelo EPO OPS real (INPADOC family-id)."""
+        families_seen: Dict[str, Dict[str, Any]] = {}
+        for patent in patents:
+            family_id = patent.get("family_id") or patent["patent_id"]
+            existing = families_seen.get(family_id)
+            if existing is None or patent.get("filing_year", 9999) < existing.get("filing_year", 9999):
+                families_seen[family_id] = patent
+        return sorted(families_seen.values(), key=lambda p: p["patent_id"])
+
     def _search_window(self, days: Optional[int] = None) -> Tuple[date, date]:
         """Janela de busca: dos últimos `days` dias (default SEARCH_WINDOW_DAYS) até a data atual (data de publicação da patente)."""
         end_date = date.today()
@@ -153,15 +218,7 @@ class PatentConnector:
             and date_range["start"] <= p["publication_date"] <= date_range["end"]
         ]
 
-        families_seen: Dict[str, Dict[str, Any]] = {}
-        for patent in matches:
-            family_id = patent.get("family_id") or patent["patent_id"]
-            existing = families_seen.get(family_id)
-            # Mantém o depósito mais antigo (menor filing_year) como representante da família
-            if existing is None or patent.get("filing_year", 9999) < existing.get("filing_year", 9999):
-                families_seen[family_id] = patent
-
-        deduped_results = sorted(families_seen.values(), key=lambda p: p["patent_id"])
+        deduped_results = self._dedupe_by_family(matches)
 
         return {
             "query": full_query,
@@ -172,6 +229,308 @@ class PatentConnector:
             "duplicate_families_collapsed": len(matches) - len(deduped_results),
             "date_range": date_range
         }
+
+    # ------------------------------------------------------------------
+    # EPO OPS (Open Patent Services) - conector real
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ops_credentials() -> Tuple[str, str]:
+        key = os.environ.get("EPO_OPS_CONSUMER_KEY")
+        secret = os.environ.get("EPO_OPS_CONSUMER_SECRET")
+        if not key or not secret:
+            raise PatentConnectorConfigError(
+                "EPO_OPS_CONSUMER_KEY/EPO_OPS_CONSUMER_SECRET ausentes em .env - registre uma conta em "
+                "https://developers.epo.org e configure as credenciais antes de chamar fetch_patents() "
+                "(ou use fetch_patents_mock() explicitamente para desenvolvimento/teste offline)."
+            )
+        return key, secret
+
+    def _get_access_token(self) -> str:
+        """Token OAuth2 client-credentials, cacheado em memória até pouco antes de expirar (OPS_TOKEN_EXPIRY_BUFFER)."""
+        now = time.monotonic()
+        if self._access_token and now < self._token_expires_at:
+            return self._access_token
+
+        key, secret = self._ops_credentials()
+        basic = base64.b64encode(f"{key}:{secret}".encode("utf-8")).decode("ascii")
+        req = urllib.request.Request(
+            self.OPS_TOKEN_URL,
+            data=b"grant_type=client_credentials",
+            headers={
+                "Authorization": f"Basic {basic}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "ActivesPredict/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.OPS_REQUEST_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise ConnectorRequestError(f"Falha ao autenticar no EPO OPS (OAuth2): HTTP {e.code}") from e
+        except (urllib.error.URLError, socket.timeout, TimeoutError, json.JSONDecodeError, KeyError) as e:
+            raise ConnectorRequestError(f"Falha ao autenticar no EPO OPS (OAuth2): {e}") from e
+
+        self._access_token = payload["access_token"]
+        self._token_expires_at = now + int(payload.get("expires_in", 1199)) - self.OPS_TOKEN_EXPIRY_BUFFER
+        return self._access_token
+
+    def _throttled_ops_request(self, url: str) -> bytes:
+        """
+        Requisição autenticada ao EPO OPS respeitando OPS_MIN_REQUEST_INTERVAL,
+        com retry/backoff em HTTP 429/403 (quota/throttling - ver header
+        x-throttling-control da resposta) e em timeout/erro de rede. HTTP 404
+        com fault SERVER.EntityNotFound é devolvido normalmente ao chamador
+        (não é falha - significa 'zero resultados para esta busca exata'),
+        nunca convertido em exceção.
+        """
+        last_error: Optional[str] = None
+        for attempt in range(self.OPS_MAX_RETRIES):
+            token = self._get_access_token()
+            elapsed = time.monotonic() - self._last_ops_request_at
+            if elapsed < self.OPS_MIN_REQUEST_INTERVAL:
+                time.sleep(self.OPS_MIN_REQUEST_INTERVAL - elapsed)
+
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Range": f"1-{self.OPS_MAX_RESULTS}",
+                    "User-Agent": "ActivesPredict/1.0",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.OPS_REQUEST_TIMEOUT) as response:
+                    self._last_ops_request_at = time.monotonic()
+                    return response.read()
+            except urllib.error.HTTPError as e:
+                self._last_ops_request_at = time.monotonic()
+                body = e.read()
+                if e.code == 404 and b"SERVER.EntityNotFound" in body:
+                    return body
+                last_error = f"HTTP {e.code}: {body[:200]!r}"
+                if e.code in (429, 403) and attempt < self.OPS_MAX_RETRIES - 1:
+                    self._access_token = None  # 403 pode indicar token expirado - força renovação
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise ConnectorRequestError(f"Falha ao acessar EPO OPS ({url}): {last_error}")
+            except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+                self._last_ops_request_at = time.monotonic()
+                last_error = str(e)
+                if attempt < self.OPS_MAX_RETRIES - 1:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+
+        raise ConnectorRequestError(f"Falha ao acessar EPO OPS após {self.OPS_MAX_RETRIES} tentativas: {last_error}")
+
+    def _cache_path(self, cache_key: str) -> str:
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+        return os.path.join(self.CACHE_DIR, f"{digest}.json")
+
+    def _cache_read(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        path = self._cache_path(cache_key)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                entry = json.load(f)
+            cached_at = datetime.fromisoformat(entry["cached_at"])
+            if datetime.now(timezone.utc) - cached_at > timedelta(days=self.CACHE_TTL_DAYS):
+                return None
+            return entry["payload"]
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+
+    def _cache_write(self, cache_key: str, payload: Dict[str, Any]) -> None:
+        try:
+            with open(self._cache_path(cache_key), "w", encoding="utf-8") as f:
+                json.dump({"cached_at": datetime.now(timezone.utc).isoformat(), "payload": payload}, f, ensure_ascii=False)
+        except OSError:
+            pass  # cache é best-effort - falha ao gravar nunca deve derrubar a busca
+
+    @staticmethod
+    def _escape_cql_term(term: str) -> str:
+        return term.replace('"', '\\"')
+
+    def _build_cql_query(self, query: str, exclusions: Optional[List[str]], start_date: date, end_date: date) -> str:
+        """
+        Monta a query CQL real enviada ao EPO OPS: busca o termo no título OU
+        resumo, restrita à janela de datas (pd within), com as exclusões do
+        ativo agrupadas numa ÚNICA cláusula 'not (... or ...)' - o OPS aceita
+        no máximo 1 operador NOT por query (confirmado ao vivo:
+        CLIENT.NotOperatorMaxNumber acima disso).
+        """
+        q = self._escape_cql_term(query)
+        cql = f'(ti="{q}" or ab="{q}") and pd within "{start_date.strftime("%Y%m%d")},{end_date.strftime("%Y%m%d")}"'
+        excl_terms = [self._escape_cql_term(t) for t in (exclusions or []) if t]
+        if excl_terms:
+            grouped = " or ".join(f'ab="{t}"' for t in excl_terms)
+            cql += f' not ({grouped})'
+        return cql
+
+    def _normalize_ipc(self, raw_text: str) -> str:
+        match = self._IPC_TEXT_PATTERN.search(raw_text or "")
+        if not match:
+            return (raw_text or "").strip()
+        section_class_subclass, main_group, subgroup = match.groups()
+        return f"{section_class_subclass}{main_group}/{subgroup}"
+
+    def _parse_exchange_document(self, doc_el) -> Optional[Dict[str, Any]]:
+        """Extrai os campos usados pelo pipeline (mesmo formato de fetch_patents_mock) de um <exchange-document> do EPO OPS."""
+        NS = self._NS
+        country = doc_el.get("country", "")
+        doc_number = doc_el.get("doc-number", "")
+        kind = doc_el.get("kind", "")
+        if not (country and doc_number and kind):
+            return None
+        patent_id = f"{country}{doc_number}{kind}"
+        family_id = doc_el.get("family-id") or patent_id
+
+        biblio = doc_el.find("ex:bibliographic-data", NS)
+        if biblio is None:
+            return None
+
+        titles = biblio.findall("ex:invention-title", NS)
+        title = ""
+        for t in titles:
+            if t.get("lang") == "en" and (t.text or "").strip():
+                title = t.text.strip()
+                break
+        if not title:
+            for t in titles:
+                if (t.text or "").strip():
+                    title = t.text.strip()
+                    break
+
+        publication_date = ""
+        for doc_id in biblio.findall("ex:publication-reference/ex:document-id", NS):
+            if doc_id.get("document-id-type") == "docdb":
+                d = doc_id.findtext("ex:date", default="", namespaces=NS)
+                if d:
+                    publication_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+                break
+
+        filing_year: Optional[int] = None
+        for doc_id in biblio.findall("ex:application-reference/ex:document-id", NS):
+            d = doc_id.findtext("ex:date", default="", namespaces=NS)
+            if d and len(d) >= 4:
+                filing_year = int(d[0:4])
+                break
+        if filing_year is None:
+            for doc_id in biblio.findall("ex:priority-claims/ex:priority-claim/ex:document-id", NS):
+                d = doc_id.findtext("ex:date", default="", namespaces=NS)
+                if d and len(d) >= 4:
+                    filing_year = int(d[0:4])
+                    break
+        if filing_year is None and publication_date:
+            filing_year = int(publication_date[0:4])
+
+        assignee = ""
+        applicants = biblio.findall("ex:parties/ex:applicants/ex:applicant", NS)
+        for a in applicants:
+            if a.get("data-format") == "epodoc":
+                name = a.findtext("ex:applicant-name/ex:name", default="", namespaces=NS)
+                if name:
+                    assignee = name.strip()
+                    break
+        if not assignee and applicants:
+            assignee = (applicants[0].findtext("ex:applicant-name/ex:name", default="", namespaces=NS) or "").strip()
+
+        ipc_code = ""
+        first_ipc = biblio.find("ex:classifications-ipcr/ex:classification-ipcr/ex:text", NS)
+        if first_ipc is not None and first_ipc.text:
+            ipc_code = self._normalize_ipc(first_ipc.text)
+
+        return {
+            "patent_id": patent_id,
+            "family_id": family_id,
+            "title": title,
+            "ipc_code": ipc_code,
+            "filing_year": filing_year or 9999,
+            "assignee": assignee,
+            "publication_date": publication_date,
+        }
+
+    def fetch_patents_live(self, query: str, exclusions: Optional[List[str]] = None, days: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Busca patentes REAIS no EPO OPS via CQL, restrita à janela dos
+        últimos `days` dias (default SEARCH_WINDOW_DAYS, publication_date),
+        com as exclusões do ativo aplicadas na origem e deduplicação por
+        família de patentes (INPADOC family-id retornado pelo próprio OPS).
+        Resultados são cacheados em disco (CACHE_DIR) por CACHE_TTL_DAYS dias,
+        chaveados pela query CQL exata + janela - reexecuções dentro desse
+        prazo não geram nova chamada de rede nem consomem quota.
+
+        Resiliente a falha de rede/timeout/quota: retorna uma resposta vazia
+        e degradada (nunca propaga a exceção, nunca cai para dado mock) -
+        mesmo contrato de connectors.pubmed.PubMedConnector.search_articles().
+        Erro de CONFIGURAÇÃO (credenciais ausentes) é a única exceção que
+        propaga - ver fetch_patents().
+        """
+        start_date, end_date = self._search_window(days=days)
+        date_range = {"start": start_date.isoformat(), "end": end_date.isoformat()}
+        full_query = self._build_cql_query(query, exclusions, start_date, end_date)
+        query_hash = self._query_hash(full_query)
+
+        cache_key = f"{full_query}|Range=1-{self.OPS_MAX_RESULTS}"
+        cached = self._cache_read(cache_key)
+        if cached is not None:
+            return {**cached, "query": full_query, "query_hash": query_hash, "date_range": date_range, "from_cache": True}
+
+        url = f"{self.OPS_SEARCH_URL}?q={urllib.parse.quote(full_query)}"
+        try:
+            raw = self._throttled_ops_request(url)
+        except ConnectorRequestError as e:
+            return {
+                "query": full_query, "query_hash": query_hash, "results": [], "total_found": 0,
+                "total_after_dedup": 0, "duplicate_families_collapsed": 0, "date_range": date_range,
+                "error": str(e), "source": "EPO_OPS_LIVE"
+            }
+
+        if b"SERVER.EntityNotFound" in raw:
+            payload = {"results": [], "total_found": 0, "total_after_dedup": 0, "duplicate_families_collapsed": 0, "source": "EPO_OPS_LIVE"}
+            self._cache_write(cache_key, payload)
+            return {**payload, "query": full_query, "query_hash": query_hash, "date_range": date_range}
+
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
+            return {
+                "query": full_query, "query_hash": query_hash, "results": [], "total_found": 0,
+                "total_after_dedup": 0, "duplicate_families_collapsed": 0, "date_range": date_range,
+                "error": f"Falha ao interpretar XML do EPO OPS: {e}", "source": "EPO_OPS_LIVE"
+            }
+
+        biblio_search = root.find("ops:biblio-search", self._NS)
+        total_found = int(biblio_search.get("total-result-count", "0")) if biblio_search is not None else 0
+
+        raw_patents = [
+            parsed for doc_el in root.findall(".//ex:exchange-document", self._NS)
+            for parsed in [self._parse_exchange_document(doc_el)] if parsed is not None
+        ]
+        deduped_results = self._dedupe_by_family(raw_patents)
+
+        payload = {
+            "results": deduped_results,
+            "total_found": total_found,
+            "total_after_dedup": len(deduped_results),
+            "duplicate_families_collapsed": len(raw_patents) - len(deduped_results),
+            "source": "EPO_OPS_LIVE"
+        }
+        self._cache_write(cache_key, payload)
+        return {**payload, "query": full_query, "query_hash": query_hash, "date_range": date_range}
+
+    def fetch_patents(self, query: str, exclusions: Optional[List[str]] = None, days: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Ponto de entrada de produção. Exige credenciais reais do EPO OPS
+        (EPO_OPS_CONSUMER_KEY/EPO_OPS_CONSUMER_SECRET em .env) - levanta
+        PatentConnectorConfigError se ausentes, nunca cai silenciosamente
+        para fetch_patents_mock() (base fabricada). Use fetch_patents_mock()
+        diretamente e explicitamente para desenvolvimento/teste offline.
+        """
+        self._ops_credentials()  # valida cedo - erro de configuração explícito, não uma busca vazia
+        return self.fetch_patents_live(query, exclusions=exclusions, days=days)
 
     def process_patent(self, patent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Processa a patente e resolve a entidade do ativo associado."""
@@ -265,13 +624,21 @@ class PatentConnector:
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+
     resolver = EntityResolver(taxonomy_path="data/taxonomy/ativos_mvp.json")
     patent_conn = PatentConnector(resolver=resolver)
 
     asset = next(a for a in resolver.assets if a["asset_id"] == "AT-029")
-    print(f"Buscando Patentes por '{asset['canonical_name']}' (exclusions={asset['exclusions']})...")
+    print(f"Buscando Patentes REAIS (EPO OPS) por '{asset['canonical_name']}' (exclusions={asset['exclusions']})...")
 
-    search_result = patent_conn.fetch_patents_mock("Cannabis sativa", exclusions=asset["exclusions"])
+    try:
+        search_result = patent_conn.fetch_patents("Cannabis sativa", exclusions=asset["exclusions"], days=patent_conn.TRACTION_WINDOW_DAYS)
+    except PatentConnectorConfigError as e:
+        print(f"\n[!] {e}\nCaindo para fetch_patents_mock() só para esta demonstração offline.")
+        search_result = patent_conn.fetch_patents_mock("Cannabis sativa", exclusions=asset["exclusions"])
+
     print(f"Query exata: {search_result['query']}")
     print(f"Query hash (SHA256): {search_result['query_hash']}")
     print(f"Janela de busca: {search_result['date_range']['start']} a {search_result['date_range']['end']}")
@@ -283,4 +650,5 @@ if __name__ == "__main__":
         print(f"\n[Patente {processed['patent_id']}] (família {processed['family_id']})")
         print(f"Título: {processed['title']}")
         print(f"Titular (Assignee): {processed['assignee']}")
+        print(f"Link: {patent_conn.GOOGLE_PATENTS_URL.format(patent_id=processed['patent_id'])}")
         print(f"Entidade Resolvida: {processed['entity_match']}")

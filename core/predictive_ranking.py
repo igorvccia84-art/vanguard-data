@@ -40,11 +40,31 @@ TIER_EMERGING_STAR = "Estrela Emergente"
 TIER_DARK_HORSE = "Dark Horse"
 TIER_MONITORING = "Monitoramento"
 
-# Soma mínima de Tração Científica + Industrial para o tier "Estrela
-# Emergente" na classificação do catálogo completo (classify_precedence_tier) -
-# mesmo limiar usado em core/llm_analysis.py e reports/pdf_generator.py para
-# a recomendação padrão de Inovação & P&D de nível "alta".
-_EMERGING_TIER_THRESHOLD = 10.0
+# Piso mínimo exigido em CADA componente (Tração Científica, Tração
+# Industrial) para o tier "Estrela Emergente" na classificação do catálogo
+# completo (classify_precedence_tier) - mesmos limiares usados em
+# core/llm_analysis.py e reports/pdf_generator.py para a recomendação padrão
+# de Inovação & P&D de nível "alta".
+#
+# CORRIGIDO (2026-08-19): antes, a regra era uma SOMA (sci + ind >= 10.0),
+# o que permitia que um único componente saturado (ex.: Tração Industrial
+# em 10.0/10) sozinho empurrasse o ativo para "Estrela Emergente" mesmo com
+# o outro componente ZERADO (achado real: Cúrcuma/AT-015 com Tração
+# Científica 0.0 - nenhum artigo verificado em 12 meses - ainda assim
+# classificado "Estrela Emergente" só pela Tração Industrial saturada). A
+# legenda do relatório define essa categoria como "elevada validação
+# científica" - um componente zerado nunca deveria satisfazer essa
+# definição, não importa quão alto o outro componente esteja. A regra agora
+# exige os dois pisos INDEPENDENTEMENTE (AND, não soma) - 5.0 é o ponto
+# médio da escala 0-10, o mesmo valor que o componente [G] de Tração
+# Científica já usa como "neutro" na ausência de linha de base
+# (core/score_engine.py calculate_scientific_traction_breakdown). Como
+# MIN_SCI_FOR_EMERGING_STAR + MIN_IND_FOR_EMERGING_STAR == 10.0, a antiga
+# checagem de soma fica estritamente subsumida por este par de pisos
+# (qualquer par que passe os dois pisos automaticamente soma >= 10.0) - por
+# isso foi removida, não mantida como uma terceira condição redundante.
+MIN_SCI_FOR_EMERGING_STAR = 5.0
+MIN_IND_FOR_EMERGING_STAR = 5.0
 
 # Níveis de 'sinal_comercial_comex' (core.score_engine.calculate_commercial_signal_level)
 # que caracterizam Risco de Oferta na árvore de precedência.
@@ -64,10 +84,10 @@ COVERAGE_CAUSE_UNKNOWN = "Causa não determinada"
 
 class PredictiveRankingEngine:
     """
-    Filtro preditivo que seleciona exatamente 8 ativos por relatório a partir
-    do catálogo global, classificando-os em 3 categorias preditivas visíveis
-    no PDF, com a seleção da categoria de risco respeitando a árvore de
-    precedência da matriz de classificação:
+    Filtro preditivo que seleciona, por ativo, os que genuinamente
+    qualificam para cada uma das 3 categorias preditivas visíveis no PDF, a
+    partir do catálogo global, com a seleção da categoria de risco
+    respeitando a árvore de precedência da matriz de classificação:
 
       Risco Regulatório > Risco de Oferta > Dados Insuficientes/Não Classificado > Estrela Emergente > Dark Horse > Monitoramento
 
@@ -77,14 +97,39 @@ class PredictiveRankingEngine:
         (R_trade - concentração/tendência de fornecedores) — um ativo com
         risco regulatório alto nunca é "roubado" pela categoria Estrela
         Emergente, mesmo com Tração Científica/Industrial altas.
-      - Emerging Stars: maior soma de Tração Científica + Tração Industrial,
-        entre os ativos que não caíram em nenhum tier de risco acima.
+      - Emerging Stars: exige piso mínimo em CADA componente (MIN_SCI_FOR_EMERGING_STAR/
+        MIN_IND_FOR_EMERGING_STAR - um componente zerado nunca qualifica,
+        não importa quão alto o outro esteja) e, entre os elegíveis, maior
+        soma de Tração Científica + Tração Industrial, entre os ativos que
+        não caíram em nenhum tier de risco acima.
       - Disruptive Dark Horses: Tração Científica positiva combinada com
         Tração Industrial nula, entre os remanescentes.
-      - Monitoramento: não é uma categoria visível no relatório (que só
-        mostra os 8 selecionados) — é o tier residual de classify_precedence_tier()
-        para os demais ativos do catálogo, usado apenas para auditoria/log
-        completo (ver Fase 2 de main.py).
+      - Monitoramento: não é uma categoria visível no relatório — é o tier
+        residual de classify_precedence_tier() para os demais ativos do
+        catálogo, usado apenas para auditoria/log completo (ver Fase 2 de
+        main.py). NUNCA usado para completar a lista até um número fixo.
+
+    O TOTAL de ativos retornado é DINÂMICO — soma de quantos genuinamente
+    qualificaram em cada categoria, no máximo *_count de cada uma (nunca um
+    piso). Pode ser 0 (nenhum ativo qualifica em nenhuma categoria nesta
+    execução) até high_risk_count + emerging_stars_count + dark_horses_count.
+    CORRIGIDO (2026-08-19): antes existia um passo de preenchimento até
+    exatamente 8 linhas, que auditoria de relatórios já gerados confirmou
+    ter contaminado com preenchimento fabricado rotulado "Estrela Emergente"
+    - ver METHODOLOGY.md, seção "Preenchimento fabricado removido". Foi
+    removido sem substituto - nunca reintroduzir um piso fixo de linhas
+    aqui, mesmo que a motivação seja só estética/layout do PDF.
+
+    CORRIGIDO (2026-08-19, mesmo dia): a separação "risco nunca é roubado
+    por Estrela Emergente" (linhas acima) só era verdadeira para quem COUBE
+    no teto de high_risk_count no passo 1 - um ativo de risco além desse
+    teto continuava no pool e podia ser promovido a Estrela Emergente/Dark
+    Horse nos passos seguintes, porque o filtro só checava "já
+    selecionado", não "tem sinal de risco". Os passos 2 e 3 agora excluem
+    diretamente por _is_regulatory_risk/_is_supply_risk, não só por
+    selected_ids - a separação categórica é real agora, não dependente do
+    teto. Ver METHODOLOGY.md, seção "Separação categórica de risco
+    corrigida".
     """
 
     def __init__(self, emerging_stars_count: int = 3, high_risk_count: int = 3, dark_horses_count: int = 2):
@@ -123,7 +168,7 @@ class PredictiveRankingEngine:
 
         sci = cls._parse_score(evaluation.get("tracao_cientifica", "0/10"))
         ind = cls._parse_score(evaluation.get("tracao_industrial", "0/10"))
-        if (sci + ind) >= _EMERGING_TIER_THRESHOLD:
+        if sci >= MIN_SCI_FOR_EMERGING_STAR and ind >= MIN_IND_FOR_EMERGING_STAR:
             return TIER_EMERGING_STAR
         if sci > 0 and ind == 0:
             return TIER_DARK_HORSE
@@ -180,7 +225,10 @@ class PredictiveRankingEngine:
     def select_predictive_assets(self, evaluations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Recebe a lista de avaliações de TODOS os ativos do catálogo e retorna
-        exatamente 8, cada um com o campo adicional 'predictive_category'.
+        só os que genuinamente qualificam em cada categoria preditiva (ver
+        docstring da classe), cada um com o campo adicional
+        'predictive_category'. Tamanho da lista retornada é DINÂMICO -
+        nunca preenchido artificialmente até um total fixo.
         """
         enriched = [
             {
@@ -216,13 +264,38 @@ class PredictiveRankingEngine:
             selected_ids.add(c["asset_id"])
 
         # 2. Emerging Stars — maior soma Científica + Industrial, entre os
-        #    ativos que não caíram em nenhum tier de risco acima E que têm
-        #    evidência mínima verificada (MIN_VERIFIED_EVIDENCE) - um ativo
-        #    "Dados Insuficientes/Não Classificado" nunca é elegível a esta
-        #    categoria de oportunidade, por maior que seja seu score bruto.
+        #    ativos que NÃO TÊM sinal de risco (nem regulatório nem comercial -
+        #    checado diretamente por _is_regulatory_risk/_is_supply_risk, NÃO
+        #    por "não caiu no teto do passo 1" - ver correção de 2026-08-19
+        #    abaixo, era exatamente essa diferença que permitia o bug), que
+        #    têm evidência mínima verificada (MIN_VERIFIED_EVIDENCE) E que
+        #    atingem o piso mínimo EM CADA componente (MIN_SCI_FOR_EMERGING_STAR/
+        #    MIN_IND_FOR_EMERGING_STAR, mesma regra e mesmo motivo de
+        #    classify_precedence_tier - um ativo "Dados Insuficientes/Não
+        #    Classificado" nunca é elegível a esta categoria de oportunidade,
+        #    por maior que seja seu score bruto, e um componente ZERADO
+        #    nunca é "elevado" só porque o outro está saturado.
+        #
+        # CORRIGIDO (2026-08-19): antes, o filtro só excluía quem já estava
+        # em `selected_ids` (ou seja, quem COUBE no teto de high_risk_count no
+        # passo 1) - um ativo com risco real que NÃO coubesse nesse teto
+        # (ex.: um 4º ativo de risco, com high_risk_count=3) continuava no
+        # pool de `enriched` e podia ser promovido a "Estrela Emergente" aqui,
+        # mesmo tendo sinal de risco genuíno. classify_precedence_tier() nunca
+        # tinha esse problema (não usa teto nenhum - risco sempre precede
+        # oportunidade, sem exceção) - o defeito era só de
+        # select_predictive_assets(), a função que decide o badge exibido no
+        # PDF. Ver METHODOLOGY.md, seção "Separação categórica de risco
+        # corrigida", para o histórico completo.
         target = len(selected) + self.emerging_stars_count
         for c in sorted(
-            [c for c in enriched if c["asset_id"] not in selected_ids and c["_has_sufficient_evidence"]],
+            [
+                c for c in enriched
+                if c["asset_id"] not in selected_ids
+                and not c["_is_regulatory_risk"] and not c["_is_supply_risk"]
+                and c["_has_sufficient_evidence"]
+                and c["_sci"] >= MIN_SCI_FOR_EMERGING_STAR and c["_ind"] >= MIN_IND_FOR_EMERGING_STAR
+            ],
             key=lambda x: (x["_sci"] + x["_ind"]),
             reverse=True
         ):
@@ -232,13 +305,17 @@ class PredictiveRankingEngine:
             selected_ids.add(c["asset_id"])
 
         # 3. Disruptive Dark Horses — sinal científico positivo sem tração
-        #    industrial, mesma exigência de evidência mínima verificada do
-        #    passo 2 (evita rotular de "Dark Horse" um ativo baseado num
-        #    único match isolado - anedota, não sinal estatístico).
+        #    industrial, mesma exclusão de sinal de risco e mesma exigência
+        #    de evidência mínima verificada do passo 2 (evita rotular de
+        #    "Dark Horse" um ativo com risco real que não coube no teto do
+        #    passo 1, ou baseado num único match isolado - anedota, não sinal
+        #    estatístico).
         dark_horse_candidates = sorted(
             [
                 c for c in enriched
-                if c["asset_id"] not in selected_ids and c["_has_sufficient_evidence"]
+                if c["asset_id"] not in selected_ids
+                and not c["_is_regulatory_risk"] and not c["_is_supply_risk"]
+                and c["_has_sufficient_evidence"]
                 and c["_sci"] > 0 and c["_ind"] == 0
             ],
             key=lambda x: x["_sci"],
@@ -251,37 +328,24 @@ class PredictiveRankingEngine:
             selected.append({**c, "predictive_category": CATEGORY_DARK_HORSES})
             selected_ids.add(c["asset_id"])
 
-        # 4. Preenchimento — se alguma categoria não teve candidatos
-        #    suficientes, completa até 8 com os próximos melhores por sinal
-        #    combinado (sem badge próprio no PDF - exibidos como Emerging
-        #    Stars, mesma convenção já usada antes desta mudança). Primeiro
-        #    passo só entre ativos com evidência mínima verificada (tier
-        #    Monitoramento); só recorre ao tier Dados Insuficientes/Não
-        #    Classificado como último recurso, para ainda entregar exatamente 8.
-        if len(selected) < 8:
-            remaining_with_evidence = sorted(
-                [c for c in enriched if c["asset_id"] not in selected_ids and c["_has_sufficient_evidence"]],
-                key=lambda x: (x["_sci"] + x["_ind"]),
-                reverse=True
-            )
-            for c in remaining_with_evidence:
-                if len(selected) >= 8:
-                    break
-                selected.append({**c, "predictive_category": CATEGORY_EMERGING_STARS})
-                selected_ids.add(c["asset_id"])
-
-        if len(selected) < 8:
-            remaining_any = sorted(
-                [c for c in enriched if c["asset_id"] not in selected_ids],
-                key=lambda x: (x["_sci"] + x["_ind"]),
-                reverse=True
-            )
-            for c in remaining_any:
-                if len(selected) >= 8:
-                    break
-                selected.append({**c, "predictive_category": CATEGORY_EMERGING_STARS})
-                selected_ids.add(c["asset_id"])
-
+        # SEM passo de preenchimento. CORRIGIDO (2026-08-19): até aqui, um
+        # passo 4 completava a lista até exatamente 8 com os "próximos
+        # melhores por sinal combinado" - mesmo sem atingir o piso de
+        # nenhuma categoria genuína (nem sequer evidência mínima verificada,
+        # no último recurso) - e rotulava esse preenchimento como "Emerging
+        # Stars" por não existir um badge dedicado a isso. Auditoria de
+        # relatórios já gerados (reports/output/, não versionado) confirmou
+        # que esse mecanismo já tinha contaminado relatórios reais: 5 das 8
+        # linhas "Estrela Emergente" do PT-BR mais recente e 3 das 4 do PT-PT
+        # anterior eram preenchimento, não qualificação genuína (nenhuma
+        # batia nem a soma antiga ≥ 10, muito menos o piso por componente).
+        # A partir de agora, o relatório mostra exatamente os ativos que
+        # genuinamente qualificaram em cada categoria nos passos 1-3 acima -
+        # nunca menos rigoroso que isso, mesmo que o total fique abaixo de 8
+        # ou que alguma categoria fique com zero ativos nesta edição. Ver
+        # METHODOLOGY.md, seção "Preenchimento fabricado removido", para o
+        # histórico completo e reports/pdf_generator.py para como o PDF
+        # comunica uma categoria vazia sem fabricar uma linha de tabela.
         for c in selected:
             c.pop("_sci", None)
             c.pop("_ind", None)
@@ -290,7 +354,7 @@ class PredictiveRankingEngine:
             c.pop("_is_supply_risk", None)
             c.pop("_has_sufficient_evidence", None)
 
-        return selected[:8]
+        return selected
 
 
 if __name__ == "__main__":

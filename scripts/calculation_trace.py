@@ -76,12 +76,14 @@ def trace_asset(asset_id: str, resolver, pubmed_conn, patent_conn, comex_conn, s
     print(f"Janela: {baseline_search['date_range']['start']} a {baseline_search['date_range']['end']}")
     print(f"Contagem bruta reportada pelo NCBI (esearch 'count', sem efetch): {baseline_search['count']}")
 
-    # ---- 3. Patentes (janela de tração, 12 meses) - ENTRADA de T_i (BASE MOCK) ----
-    print("\n--- [3] Patentes - janela de Tração Industrial (12 meses) ---")
-    print("ATENÇÃO: connectors/patents.py NÃO consulta uma API real de patentes - fetch_patents_mock()")
-    print("retorna uma base de dados FABRICADA/ilustrativa embutida no código (_mock_database()).")
-    patent_traction_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS)
-    print(f"Registros mock retornados (após dedup por família): {patent_traction_search['total_after_dedup']}")
+    # ---- 3. Patentes (janela de tração, 12 meses) - ENTRADA de T_i (EPO OPS REAL) ----
+    print("\n--- [3] Patentes - janela de Tração Industrial (12 meses, dados AO VIVO do EPO OPS) ---")
+    patent_traction_search = patent_conn.fetch_patents(search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS)
+    print(f"Query CQL exata enviada ao EPO OPS: {patent_traction_search['query']}")
+    print(f"Total reportado pelo EPO OPS (biblio-search total-result-count): {patent_traction_search['total_found']}")
+    print(f"Registros retornados (após dedup por família INPADOC): {patent_traction_search['total_after_dedup']}")
+    if patent_traction_search.get("error"):
+        print(f"[!] Erro na busca EPO OPS: {patent_traction_search['error']}")
 
     patent_traction_results = []
     for raw in patent_traction_search["results"]:
@@ -89,14 +91,15 @@ def trace_asset(asset_id: str, resolver, pubmed_conn, patent_conn, comex_conn, s
         patent_traction_results.append(processed)
         pid = processed["patent_id"]
         gp_link = f"https://patents.google.com/patent/{pid}/en"
-        print(f"  Patente {pid} (mock, assignee={processed.get('assignee')})")
-        print(f"    Título (mock, usado para Entity Resolution local): {processed.get('title')}")
+        print(f"  Patente {pid} (EPO OPS, assignee={processed.get('assignee')}, família={processed.get('family_id')})")
+        print(f"    Título (EPO OPS, bruto): {processed.get('title')}")
         em = processed.get("entity_match")
-        print(f"    Entity Resolution LOCAL (contra o próprio título mock): {'match' if em else 'sem match'}"
+        print(f"    Entity Resolution LOCAL (contra o título real do EPO OPS): {'match' if em else 'sem match'}"
               + (f" (confidence_score={em.get('confidence_score')})" if em else ""))
-        # Validação real ao vivo contra o Google Patents - desde a correção de
-        # 2026-08-19 (ver METHODOLOGY.md), este resultado É o que decide se a
-        # patente entra ou não na fórmula de T_i (não é mais só cosmético).
+        # Validação independente ao vivo contra o Google Patents - camada de
+        # confirmação adicional sobre o resultado já real do EPO OPS (ver
+        # METHODOLOGY.md). Continua sendo o que decide se a patente entra ou
+        # não na fórmula de T_i (correção de 2026-08-19).
         live = patent_conn.validate_patent(pid, canonical_name)
         print(f"    Validação AO VIVO no Google Patents ({gp_link}): valid={live['valid']}"
               + (f" -> {live['reason']}" if not live["valid"] else " (existe e confirma a entidade)"))
@@ -105,13 +108,13 @@ def trace_asset(asset_id: str, resolver, pubmed_conn, patent_conn, comex_conn, s
         p["patent_id"] for p in patent_traction_results
         if patent_conn.validate_patent(p["patent_id"], canonical_name)["valid"]
     }
-    n_patents_mock_total = len(patent_traction_results)
+    n_patents_found_total = len(patent_traction_results)
     n_patents_feeding_score = len(valid_patent_ids_live)
-    # CORRIGIDO (2026-08-19): T_i agora é calculada só com as patentes que sobrevivem
-    # à validação ao vivo - filtra ANTES de chamar generate_assessment(), igual ao
-    # main.py em produção (ver METHODOLOGY.md, "Limitação conhecida" - histórico).
+    # Ver METHODOLOGY.md ("Limitação conhecida" - histórico): T_i é calculada só com as
+    # patentes que sobrevivem à validação ao vivo - filtra ANTES de chamar generate_assessment(),
+    # igual ao main.py em produção.
     patent_traction_results = [p for p in patent_traction_results if p["patent_id"] in valid_patent_ids_live]
-    print(f"\nPatentes mock retornadas pela busca: {n_patents_mock_total} | Validadas ao vivo (entram em T_i): {n_patents_feeding_score}")
+    print(f"\nPatentes reais (EPO OPS) retornadas pela busca: {n_patents_found_total} | Validadas ao vivo (entram em T_i): {n_patents_feeding_score}")
 
     # ---- 4. Comércio Exterior (MOCK, nunca uma API real neste ambiente) ----
     print("\n--- [4] Comércio Exterior / Regulatório (usado em Risco de Oferta e Confiança) ---")

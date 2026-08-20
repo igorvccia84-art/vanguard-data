@@ -1,5 +1,6 @@
 import sys
 import io
+import re
 import hashlib
 from typing import Dict, Any, Optional
 
@@ -67,43 +68,60 @@ class RegulatoryComexConnector:
     # categoria de risco regulatório real e conhecida do ativo (ex.: ácido
     # glicirrízico no alcaçuz, hidroquinona-precursores na arbutina, derivados
     # de cannabis, limites de AHA/BHA leave-on) - não são valores oficiais
-    # consultados em tempo real.
+    # consultados em tempo real. Mantida MANUALMENTE - não há mecanismo de
+    # atualização automática nem de detecção de desatualização.
+    #
+    # RASTREABILIDADE (2026-08-20, obrigatório em TODA entrada desta base e
+    # de EU_REGULATORY_OVERRIDES/FDA_REGULATORY_OVERRIDES abaixo - validado
+    # na importação do módulo, ver _validate_regulatory_registries()):
+    #   - "source": string não vazia citando a norma/resolução que embasa a
+    #     entrada (ex.: "Anvisa RDC 07/2015"), OU declarando explicitamente a
+    #     ausência de uma citação específica quando a classificação vem só de
+    #     avaliação interna, não de um dispositivo legal citável.
+    #   - "last_verified": data YYYY-MM-DD da última confirmação manual de
+    #     que a entrada ainda reflete a regulação vigente. NUNCA atualizada
+    #     automaticamente - reflete só quando alguém revisou a entrada à mão.
+    # Cadência de revisão recomendada: SEMESTRAL (regulação muda bem mais
+    # devagar que publicação científica/patente - ver METHODOLOGY.md, seção
+    # "Rastreabilidade do REGULATORY_REGISTRY", para a cadência completa e o
+    # motivo da diferença em relação à revisão trimestral de
+    # INDUSTRIAL_TRACTION_N_REF/MIN_SCI_FOR_EMERGING_STAR).
     REGULATORY_REGISTRY = {
-        "AT-001": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "2.0%", "alerts": []},
-        "AT-002": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": []},
-        "AT-003": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-004": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "0.5%", "alerts": ["Requer dossiê de segurança complementar"]},
-        "AT-005": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-006": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "3.0%", "alerts": []},
-        "AT-007": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": []},
-        "AT-008": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "0.1%", "alerts": ["Limite de concentração por potencial irritante (spilanthol)"]},
-        "AT-009": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-010": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-011": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-012": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "10.0%", "alerts": []},
-        "AT-013": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": []},
-        "AT-014": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "3.0%", "alerts": []},
-        "AT-015": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": []},
-        "AT-016": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "1.0%", "alerts": ["Monitoramento de pureza da resina"]},
-        "AT-017": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-018": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "0.02%", "alerts": ["Limite regulatório de ácido glicirrízico (Anvisa/EU)"]},
-        "AT-020": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-021": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-022": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-023": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-024": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": ["Rotulagem obrigatória de alérgeno (derivado de trigo)"]},
-        "AT-025": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "2.0%", "alerts": ["Precursor de hidroquinona - escrutínio regulatório elevado (clareadores)"]},
-        "AT-027": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-028": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": []},
-        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "0.2%", "alerts": ["Derivado de Cannabis sativa - barreiras regulatórias de importação/registro"]},
-        "AT-030": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "10.0%", "alerts": []},
-        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "10.0%", "alerts": ["Uso profissional acima de 10% restrito a procedimentos de peeling"]},
-        "AT-032": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "2.0%", "alerts": ["Proibido em produtos leave-on para menores de 3 anos (EU 2019/831)"]},
-        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem monografia tópica consolidada na Anvisa - uso off-label em skincare"]},
-        "AT-034": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "10.0%", "alerts": []},
-        "AT-035": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "20.0%", "alerts": ["Acima de 10% classificado como uso dermatológico/prescrição em alguns mercados"]},
+        "AT-001": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "2.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-002": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-003": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-004": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "0.5%", "alerts": ["Requer dossiê de segurança complementar"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-005": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-006": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "3.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-007": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-008": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "0.1%", "alerts": ["Limite de concentração por potencial irritante (spilanthol)"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-009": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-010": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-011": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-012": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "10.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-013": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-014": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "3.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-015": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-016": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "1.0%", "alerts": ["Monitoramento de pureza da resina"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-017": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-018": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "0.02%", "alerts": ["Limite regulatório de ácido glicirrízico (Anvisa/EU)"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-020": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-021": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-022": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-023": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-024": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "5.0%", "alerts": ["Rotulagem obrigatória de alérgeno (derivado de trigo)"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-025": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "2.0%", "alerts": ["Precursor de hidroquinona - escrutínio regulatório elevado (clareadores)"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-027": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-028": {"status": "APROVADO_USO_TOPICO", "restriction_level": "NENHUM", "max_concentration_allowed": "100%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "0.2%", "alerts": ["Derivado de Cannabis sativa - barreiras regulatórias de importação/registro"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-030": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "10.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "10.0%", "alerts": ["Uso profissional acima de 10% restrito a procedimentos de peeling"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-032": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "2.0%", "alerts": ["Proibido em produtos leave-on para menores de 3 anos (EU 2019/831)"], "source": "Regulamento (UE) 2019/831 (citado nesta entrada da base Anvisa por proximidade de regra - inconsistência de proveniência pré-existente, ver METHODOLOGY.md)", "last_verified": "2026-08-20"},
+        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem monografia tópica consolidada na Anvisa - uso off-label em skincare"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-034": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "10.0%", "alerts": [], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-035": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "20.0%", "alerts": ["Acima de 10% classificado como uso dermatológico/prescrição em alguns mercados"], "source": "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.", "last_verified": "2026-08-20"},
     }
 
     # Sobrescreve REGULATORY_REGISTRY apenas para PT-PT/ES (jurisdição UE), e
@@ -112,13 +130,13 @@ class RegulatoryComexConnector:
     # jurisdições e não precisa de entrada aqui. Referências: Regulamento (CE)
     # 1223/2009 (cosméticos, UE) e seus Anexos II/III, consultáveis via CosIng/ECHA.
     EU_REGULATORY_OVERRIDES = {
-        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A (rotulagem obrigatória)", "alerts": ["Sem limite numérico de ácido glicirrízico no Regulamento (CE) 1223/2009 - controlado via rotulagem de alérgenos"]},
-        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "2.0% (creme facial) / 0.5% (loção corporal)", "alerts": ["Alpha-Arbutin listado no Anexo III, entrada 77, do Regulamento (CE) 1223/2009"]},
-        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Extratos de folha/flor de Cannabis sativa restritos no Anexo II; derivados de semente (óleo/CBD de cânhamo industrial) avaliados caso a caso pela ECHA"]},
-        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "pH ≥ 3.5 (sem teto percentual fixo no Anexo III para uso profissional)", "alerts": []},
-        "AT-032": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "2.0% (leave-on) / 3.0% (rinse-off)", "alerts": ["Proibido em produtos leave-on para menores de 3 anos - Regulamento (UE) 2019/831, Anexo III entrada 98"]},
-        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem entrada específica no CosIng para uso tópico cosmético - uso off-label"]},
-        "AT-035": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "10.0%", "alerts": ["Concentrações mais altas (uso dermatológico) tratadas como produto medicinal, fora do escopo do Regulamento (CE) 1223/2009"]},
+        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A (rotulagem obrigatória)", "alerts": ["Sem limite numérico de ácido glicirrízico no Regulamento (CE) 1223/2009 - controlado via rotulagem de alérgenos"], "source": "Regulamento (CE) 1223/2009 (sem limite numérico de ácido glicirrízico - controlado via rotulagem de alérgenos, sem entrada de Anexo específica citada)", "last_verified": "2026-08-20"},
+        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "2.0% (creme facial) / 0.5% (loção corporal)", "alerts": ["Alpha-Arbutin listado no Anexo III, entrada 77, do Regulamento (CE) 1223/2009"], "source": "Regulamento (CE) 1223/2009, Anexo III, entrada 77 (Alpha-Arbutin)", "last_verified": "2026-08-20"},
+        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Extratos de folha/flor de Cannabis sativa restritos no Anexo II; derivados de semente (óleo/CBD de cânhamo industrial) avaliados caso a caso pela ECHA"], "source": "Regulamento (CE) 1223/2009, Anexo II (extratos de folha/flor de Cannabis sativa); avaliação ECHA caso a caso para derivados de semente", "last_verified": "2026-08-20"},
+        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "pH ≥ 3.5 (sem teto percentual fixo no Anexo III para uso profissional)", "alerts": [], "source": "Regulamento (CE) 1223/2009, Anexo III (sem entrada numérica específica citada nesta base)", "last_verified": "2026-08-20"},
+        "AT-032": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "2.0% (leave-on) / 3.0% (rinse-off)", "alerts": ["Proibido em produtos leave-on para menores de 3 anos - Regulamento (UE) 2019/831, Anexo III entrada 98"], "source": "Regulamento (UE) 2019/831, Anexo III, entrada 98", "last_verified": "2026-08-20"},
+        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem entrada específica no CosIng para uso tópico cosmético - uso off-label"], "source": "Regulamento (CE) 1223/2009 (sem entrada específica no CosIng identificada para uso tópico cosmético desta categoria)", "last_verified": "2026-08-20"},
+        "AT-035": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "10.0%", "alerts": ["Concentrações mais altas (uso dermatológico) tratadas como produto medicinal, fora do escopo do Regulamento (CE) 1223/2009"], "source": "Regulamento (CE) 1223/2009 (delimitação de escopo cosmético vs. produto medicinal, sem entrada de Anexo específica citada)", "last_verified": "2026-08-20"},
     }
 
     # Sobrescreve REGULATORY_REGISTRY para a jurisdição FDA (EUA), no mesmo
@@ -130,13 +148,13 @@ class RegulatoryComexConnector:
     # antes de qualquer uso além deste protótipo auditável. Usado por
     # get_regulatory_matrix() para compor a matriz regulatória por jurisdição.
     FDA_REGULATORY_OVERRIDES = {
-        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A (sem teto percentual fixo sob o regime FD&C Act)", "alerts": ["Ácido glicirrízico sem limite numérico codificado pela FDA para cosméticos - avaliação via GRAS/relatórios de segurança do CIR"]},
-        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Precursores de hidroquinona sob escrutínio elevado da FDA para produtos de clareamento de pele"]},
-        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Ingredientes derivados de Cannabis sativa sob posição regulatória ainda não consolidada da FDA para uso cosmético"]},
-        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "N/A (sem teto percentual fixo; uso profissional avaliado por pH/formulação)", "alerts": []},
-        "AT-032": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "N/A (monografia OTC não aplicável a uso cosmético leave-on)", "alerts": []},
-        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem monografia OTC específica para uso tópico cosmético identificada - uso off-label"]},
-        "AT-035": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A", "alerts": ["Concentrações mais altas podem ser tratadas como produto OTC (monografia de acne), fora do escopo cosmético"]},
+        "AT-019": {"status": "USO_RESTRITO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A (sem teto percentual fixo sob o regime FD&C Act)", "alerts": ["Ácido glicirrízico sem limite numérico codificado pela FDA para cosméticos - avaliação via GRAS/relatórios de segurança do CIR"], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-026": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Precursores de hidroquinona sob escrutínio elevado da FDA para produtos de clareamento de pele"], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-029": {"status": "USO_RESTRITO", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Ingredientes derivados de Cannabis sativa sob posição regulatória ainda não consolidada da FDA para uso cosmético"], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-031": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "N/A (sem teto percentual fixo; uso profissional avaliado por pH/formulação)", "alerts": [], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-032": {"status": "APROVADO_USO_TOPICO", "restriction_level": "BAIXO", "max_concentration_allowed": "N/A (monografia OTC não aplicável a uso cosmético leave-on)", "alerts": [], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-033": {"status": "EM_ANALISE", "restriction_level": "ALTO", "max_concentration_allowed": "N/A", "alerts": ["Sem monografia OTC específica para uso tópico cosmético identificada - uso off-label"], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
+        "AT-035": {"status": "APROVADO_USO_TOPICO", "restriction_level": "MEDIO", "max_concentration_allowed": "N/A", "alerts": ["Concentrações mais altas podem ser tratadas como produto OTC (monografia de acne), fora do escopo cosmético"], "source": "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.", "last_verified": "2026-08-20"},
     }
 
     # Ranking de severidade usado para calcular o "máximo de severidade
@@ -170,7 +188,9 @@ class RegulatoryComexConnector:
                 "status": "EM_ANALISE",
                 "restriction_level": "DESCONHECIDO",
                 "max_concentration_allowed": "N/A",
-                "alerts": ["Ativo não mapeado na base regulatória local"]
+                "alerts": ["Ativo não mapeado na base regulatória local"],
+                "source": "N/A - ativo não mapeado em nenhuma entrada curada da base regulatória",
+                "last_verified": None
             }))
 
             if lang.upper() in ("PT-PT", "ES") and asset_id in self.EU_REGULATORY_OVERRIDES:
@@ -182,7 +202,9 @@ class RegulatoryComexConnector:
                 "status": "FALHA_CONSULTA",
                 "restriction_level": "DESCONHECIDO",
                 "max_concentration_allowed": "N/A",
-                "alerts": [f"Falha ao consultar base regulatória: {e}"]
+                "alerts": [f"Falha ao consultar base regulatória: {e}"],
+                "source": "N/A - falha de consulta",
+                "last_verified": None
             }
 
     def get_regulatory_matrix(self, asset_id: str) -> Dict[str, Any]:
@@ -202,7 +224,9 @@ class RegulatoryComexConnector:
             "status": "EM_ANALISE",
             "restriction_level": "DESCONHECIDO",
             "max_concentration_allowed": "N/A",
-            "alerts": ["Ativo não mapeado na base regulatória FDA (mock)"]
+            "alerts": ["Ativo não mapeado na base regulatória FDA (mock)"],
+            "source": "N/A - ativo não mapeado em nenhuma entrada curada da base regulatória FDA",
+            "last_verified": None
         })))
 
         jurisdictions = {
@@ -309,6 +333,57 @@ class RegulatoryComexConnector:
             "alertas_regulatorios": self.fetch_regulatory_status(asset_id, lang=lang_key),
             "sinais_comerciais_comex": self.fetch_import_volume_mock(hs_code, asset_id=asset_id, lang=lang_key)
         }
+
+
+class RegulatoryRegistryTraceabilityError(ValueError):
+    """
+    Uma entrada de REGULATORY_REGISTRY/EU_REGULATORY_OVERRIDES/FDA_REGULATORY_OVERRIDES
+    está sem 'source' e/ou 'last_verified' válidos. Levantado na importação
+    deste módulo (ver _validate_regulatory_registries() abaixo) - nunca
+    silenciosamente ignorado. Corrigido em 2026-08-20 (auditoria: os dois
+    campos passaram a ser obrigatórios em toda entrada, ver METHODOLOGY.md,
+    seção "Rastreabilidade do REGULATORY_REGISTRY").
+    """
+
+
+_LAST_VERIFIED_DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _validate_regulatory_registries() -> None:
+    """
+    Falha explicitamente (levanta RegulatoryRegistryTraceabilityError) se
+    QUALQUER entrada das 3 bases regulatórias estiver sem 'source' (string
+    não vazia - citando a norma/resolução que embasa a entrada, ou
+    declarando explicitamente a ausência de uma citação específica) ou sem
+    'last_verified' (string YYYY-MM-DD válida - data da última confirmação
+    manual de que a entrada ainda reflete a regulação vigente). Chamada uma
+    vez na importação do módulo - uma entrada nova adicionada sem os dois
+    campos derruba a importação do pacote inteiro, não passa despercebida.
+    """
+    registries = (
+        ("REGULATORY_REGISTRY", RegulatoryComexConnector.REGULATORY_REGISTRY),
+        ("EU_REGULATORY_OVERRIDES", RegulatoryComexConnector.EU_REGULATORY_OVERRIDES),
+        ("FDA_REGULATORY_OVERRIDES", RegulatoryComexConnector.FDA_REGULATORY_OVERRIDES),
+    )
+    for registry_name, registry in registries:
+        for asset_id, entry in registry.items():
+            source = entry.get("source")
+            if not source or not isinstance(source, str):
+                raise RegulatoryRegistryTraceabilityError(
+                    f"{registry_name}['{asset_id}'] está sem 'source' (obrigatório, string não vazia) - "
+                    "toda entrada precisa citar a base/norma que embasa a classificação, mesmo que seja "
+                    "para declarar explicitamente a ausência de uma citação específica."
+                )
+            last_verified = entry.get("last_verified")
+            if not last_verified or not isinstance(last_verified, str) or not _LAST_VERIFIED_DATE_PATTERN.match(last_verified):
+                raise RegulatoryRegistryTraceabilityError(
+                    f"{registry_name}['{asset_id}'] está sem 'last_verified' válido (obrigatório, formato "
+                    "YYYY-MM-DD) - toda entrada precisa registrar a data da última confirmação manual de "
+                    "que ainda reflete a regulação vigente."
+                )
+
+
+_validate_regulatory_registries()
 
 
 if __name__ == "__main__":

@@ -88,8 +88,8 @@ def main():
         days=pubmed_conn.TRACTION_WINDOW_DAYS + SCI_BASELINE_HISTORY_DAYS, end_days_ago=pubmed_conn.TRACTION_WINDOW_DAYS
     )
 
-    patent_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions)
-    patent_traction_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS)
+    patent_search = patent_conn.fetch_patents(search_query, exclusions=exclusions)
+    patent_traction_search = patent_conn.fetch_patents(search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS)
     # Tração Industrial só conta patentes validadas ao vivo (Google Patents) - mesma
     # correção aplicada em main.py Fase 1 (ver METHODOLOGY.md).
     valid_traction_ids, _ = patent_conn.validate_patent_batch(
@@ -144,6 +144,7 @@ def main():
 
     row = {**evaluation, "scientific_traction": assessment["tracao_cientifica"], "industrial_traction": assessment["tracao_industrial"],
            "supply_risk": assessment["risco_oferta"], "confidence_level": assessment["confianca_sinal"],
+           "regulatory_source": regulatory_alerts.get("source"), "regulatory_last_verified": regulatory_alerts.get("last_verified"),
            "inovacao_pd": recs["inovacao_pd"], "compras_procurement": recs["compras_procurement"],
            "pmids": verified_pmids, "patent_ids": valid_patent_ids}
 

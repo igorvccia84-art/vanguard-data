@@ -1,5 +1,6 @@
 import sys
 import io
+import math
 from typing import List, Dict, Any, Optional
 
 if sys.stdout.encoding != 'utf-8':
@@ -31,6 +32,36 @@ PROVISIONAL_WEIGHTS_DISCLAIMER = "Pesos provisórios, ainda não calibrados por 
 # core/predictive_ranking.py) - abaixo disso, é "Dados Insuficientes/Não
 # Classificado": 1 único match é anedota, não sinal estatístico.
 MIN_VERIFIED_EVIDENCE = 2
+
+# Referência de calibração (N_ref) para calculate_industrial_traction():
+# T_i = 10 x log(1+count) / log(1+N_ref), onde `count` é o nº de patentes
+# validadas (janela de 12 meses, já confirmadas ao vivo no Google Patents -
+# ver connectors/patents.py validate_patent_batch). Um ativo com
+# `count == N_ref` atinge o teto de 10.0/10 por construção; a curva log dá
+# retornos decrescentes (a diferença entre 1 e 2 patentes pesa mais que
+# entre 5 e 6), em vez do degrau anterior que saturava em 10.0 já a partir
+# de 3 patentes de 2 titulares - ver METHODOLOGY.md, seção "Tração
+# Industrial", para o histórico completo da correção.
+#
+# CALIBRADO EM 2026-08-19 a partir de dado real: rodando o catálogo
+# completo (35 ativos) uma única vez com o conector real do EPO OPS
+# (scripts/tier_recalibration_collect.py), a contagem MÁXIMA de patentes
+# validadas observada em qualquer ativo foi 6 (AT-029, Cânhamo/CBD) - a
+# distribuição completa: 15 ativos com 0, 11 com 1, 2 com 2, 1 com 3, 1 com
+# 4, 4 com 5, 1 com 6. N_ref = 6 reflete o que "dominância industrial" de
+# fato parece neste catálogo/nicho (ativos botânicos dermocosméticos, janela
+# de 12 meses) - não um número arbitrário importado de outro domínio (ex.:
+# portfólios de patente farmacêutica, que são ordens de grandeza maiores).
+#
+# REVISÃO PERIÓDICA: recalibrar TRIMESTRALMENTE (ou sempre que um novo
+# recorde de patentes validadas for observado no catálogo), reexecutando
+# scripts/tier_recalibration_collect.py e atualizando esta constante + o
+# registro de calibração em METHODOLOGY.md. Um N_ref desatualizado (baixo
+# demais) volta a saturar o topo da escala; um N_ref alto demais comprime
+# todo o catálogo perto de zero - os dois sintomas são visíveis comparando
+# a distribuição de tracao_industrial de uma execução completa contra a
+# calibração registrada.
+INDUSTRIAL_TRACTION_N_REF = 6
 
 # Rótulos de jurisdição regulatória exibidos na Matriz Regulatória do PDF
 # (reports/pdf_generator.py), estritamente filtrados pelo target_market do
@@ -165,16 +196,37 @@ class ScoreEngine:
         sujeitas à janela legal de publicação (defasagem entre depósito e
         publicação), por isso a janela de 12 meses é mais representativa da
         proteção industrial real do que a janela de novidades de 15 dias.
+
+        Fórmula log-comprimida, calibrada por N_ref (ver
+        INDUSTRIAL_TRACTION_N_REF acima):
+
+            T_i = 10 x log(1 + count) / log(1 + N_ref)
+
+        CORRIGIDO (2026-08-19): a fórmula anterior (base_score = min(8,
+        count*3) + diversity_bonus = min(2, nº titulares únicos)) saturava
+        em 10.0/10 já a partir de 3 patentes de 2 titulares distintos - uma
+        função degrau, sem diferenciar 3 patentes de 300 (achado real:
+        Chá Verde/AT-009 com 3 patentes e Cúrcuma/AT-015 com 5 patentes
+        marcavam o mesmo 10.0/10 - ver METHODOLOGY.md). A curva log dá
+        retornos decrescentes e usa como teto o maior volume de patentes
+        validadas de fato observado no catálogo (não um número arbitrário),
+        preservando a mesma regra de piso (`count == 0` -> `0.0`, nunca
+        `log(1)/log(1+N_ref) = 0` calculado à toa) e o mesmo teto absoluto de
+        10.0 (`min(10.0, ...)`, necessário porque um novo recorde de
+        patentes pode ultrapassar o N_ref calibrado até a próxima revisão
+        trimestral). O `diversity_bonus` (nº de titulares distintos) foi
+        removido: na calibração de 2026-08-19, EM TODOS os 35 ativos do
+        catálogo o nº de titulares distintos foi idêntico ao nº de patentes
+        validadas (nenhum titular repetiu patente validada em nenhum ativo)
+        - o termo nunca divergiu de `count` nesta base real, então não
+        carregava informação adicional para justificar a complexidade extra.
         """
         total_patents = len(patent_matches)
         if total_patents == 0:
             return 0.0
 
-        assignees = set(p.get("assignee") for p in patent_matches if p.get("assignee"))
-        diversity_bonus = min(2.0, len(assignees) * 1.0)
-
-        base_score = min(8.0, total_patents * 3.0)
-        return round(min(10.0, base_score + diversity_bonus), 1)
+        raw_score = 10.0 * math.log(1 + total_patents) / math.log(1 + INDUSTRIAL_TRACTION_N_REF)
+        return round(min(10.0, raw_score), 1)
 
     def calculate_regulatory_alert_level(self, regulatory_alerts: Dict[str, Any]) -> str:
         """

@@ -192,13 +192,13 @@ def main():
             )
 
             # Patentes: aplica exclusões, restringe à janela de 15 dias (publication_date), deduplica
-            # por família de patentes, recebe resultados + query_hash. patent_conn.fetch_patents_mock()
-            # é uma base MOCK/fabricada (ver METHODOLOGY.md) - por isso todo patent_id candidato passa
-            # pela mesma validação determinística obrigatória pré-relatório usada para PMIDs
-            # (patent_conn.validate_patent_batch, Google Patents ao vivo) ANTES de entrar em
-            # 'patent_ids' (citação exibida no relatório). Só patentes reais e que confirmam a
-            # entidade do ativo chegam ao relatório - nenhuma citação de patente mock/fabricada.
-            patent_search = patent_conn.fetch_patents_mock(search_query, exclusions=exclusions)
+            # por família de patentes, recebe resultados + query_hash. patent_conn.fetch_patents() é o
+            # conector REAL do EPO OPS (OAuth2 + CQL, ver connectors/patents.py) - por isso todo patent_id
+            # candidato ainda passa pela mesma validação determinística obrigatória pré-relatório usada
+            # para PMIDs (patent_conn.validate_patent_batch, Google Patents ao vivo) ANTES de entrar em
+            # 'patent_ids' (citação exibida no relatório), como camada independente de confirmação. Só
+            # patentes que sobrevivem às duas checagens chegam ao relatório.
+            patent_search = patent_conn.fetch_patents(search_query, exclusions=exclusions)
             valid_patent_ids, rejected_patent_ids = patent_conn.validate_patent_batch(
                 [p["patent_id"] for p in patent_search["results"]], canonical_name
             )
@@ -211,14 +211,12 @@ def main():
             # Patentes estão sujeitas à defasagem legal entre depósito e publicação - a janela de
             # 12 meses é mais representativa da proteção industrial real do que a de 15 dias.
             #
-            # IMPORTANTE (achado de auditoria corrigido nesta versão): até aqui, a Tração Industrial
-            # era calculada em cima de TODAS as patentes mock retornadas por fetch_patents_mock(),
-            # mesmo as que a validação real via Google Patents rejeitaria - a validação só filtrava
-            # o que era EXIBIDO como citação, nunca realimentava o score (ver METHODOLOGY.md,
-            # "Limitação conhecida"). Agora patent_traction_results só inclui patentes que passaram
-            # pela MESMA validação ao vivo aplicada acima - o score deriva estritamente de evidência
-            # confirmada, nunca de dado mock não verificado.
-            patent_traction_search = patent_conn.fetch_patents_mock(
+            # IMPORTANTE (achado de auditoria corrigido em 2026-08-19, mantido após a troca do mock
+            # pelo EPO OPS real): a Tração Industrial só é calculada em cima das patentes que também
+            # sobrevivem à validação real via Google Patents (patent_traction_results abaixo) - a
+            # validação nunca realimentava o score antes desta correção (ver METHODOLOGY.md,
+            # "Limitação conhecida"/histórico). O score deriva estritamente de evidência confirmada.
+            patent_traction_search = patent_conn.fetch_patents(
                 search_query, exclusions=exclusions, days=patent_conn.TRACTION_WINDOW_DAYS
             )
             valid_traction_patent_ids, rejected_traction_patents = patent_conn.validate_patent_batch(
@@ -236,8 +234,9 @@ def main():
 
             # Regulatório/Comex: dossiê consolidado - Alertas Regulatórios e Sinais Comerciais/Comex + query_hash.
             # Jurisdição baseline PT-BR (Anvisa) usada para o dossiê comercial (R_trade permanece
-            # regional - não é um "pior caso" cross-jurisdição); os 8 ativos selecionados têm seus
-            # dados regulatórios/comerciais recalculados por idioma na Fase 3.
+            # regional - não é um "pior caso" cross-jurisdição); os ativos selecionados (número
+            # dinâmico, ver core/predictive_ranking.py) têm seus dados regulatórios/comerciais
+            # recalculados por idioma na Fase 3.
             hs_code = asset.get("hs_codes", [None])[0]
             dossier = comex_conn.get_asset_dossier(asset_id, hs_code=hs_code, lang="PT-BR")
             commercial_signals = dossier["sinais_comerciais_comex"]
@@ -377,11 +376,14 @@ def main():
                 f"'{_fallback_asset['canonical_name']}' -> {_rejected_fallback[0]['reason']}"
             )
 
-        # 5. Fase 2: filtro preditivo - seleciona exatamente 8 ativos, categorizados
+        # 5. Fase 2: filtro preditivo - seleciona só os ativos que genuinamente
+        #    qualificam em cada categoria (número dinâmico, nunca preenchido
+        #    até um total fixo - ver core/predictive_ranking.py select_predictive_assets()).
         print("\n" + "=" * 70)
-        print("[FASE 2] RANKING PREDITIVO - SELECIONANDO 8 ATIVOS")
+        print("[FASE 2] RANKING PREDITIVO - SELEÇÃO POR QUALIFICAÇÃO GENUÍNA")
         print("=" * 70)
         selected = ranking_engine.select_predictive_assets(all_evaluations)
+        print(f"  {len(selected)} ativo(s) qualificado(s) nesta execução (número dinâmico, sem preenchimento artificial).")
         for s in selected:
             print(f"  {s['asset_id']} {s['canonical_name']:<24} → {s['predictive_category']}")
 
@@ -403,13 +405,14 @@ def main():
             for row in coverage_report:
                 print(f"    {row['asset_id']} {row['canonical_name']:<24} -> {row['causa_raiz']}")
 
-        # 6. Fase 3: síntese via LLM (Claude Sonnet 5) apenas para os 8 selecionados,
-        #    com dados regulatórios, Risco de Oferta e recomendações recalculados
-        #    conforme a jurisdição de cada idioma (Anvisa/PT-BR; INFARMED+CosIng-ECHA/
-        #    PT-PT; AEMPS+CosIng-ECHA/ES) - a Tração Científica/Industrial não muda por
-        #    jurisdição (é baseada em evidência, não em regulação).
+        # 6. Fase 3: síntese via LLM (Claude Sonnet 5) apenas para os selecionados
+        #    (número dinâmico, ver Fase 2 acima), com dados regulatórios, Risco de
+        #    Oferta e recomendações recalculados conforme a jurisdição de cada
+        #    idioma (Anvisa/PT-BR; INFARMED+CosIng-ECHA/PT-PT; AEMPS+CosIng-ECHA/ES)
+        #    - a Tração Científica/Industrial não muda por jurisdição (é baseada em
+        #    evidência, não em regulação).
         print("\n" + "=" * 70)
-        print("[FASE 3] SÍNTESE VIA LLM (CLAUDE SONNET 5) - 8 ATIVOS SELECIONADOS")
+        print(f"[FASE 3] SÍNTESE VIA LLM (CLAUDE SONNET 5) - {len(selected)} ATIVO(S) SELECIONADO(S)")
         print("=" * 70)
 
         evaluations_by_lang = {lang: [] for lang in languages_to_generate}
@@ -430,11 +433,18 @@ def main():
             # quanto as citações exibidas no relatório derivam só de patentes reais
             # e confirmadas, nunca da base mock bruta (ver METHODOLOGY.md).
 
-            # Trava determinística pós-LLM (core/llm_analysis.py): tier real do ativo
-            # (não o predictive_category exibido, que pode vir do preenchimento de
-            # último recurso - ver core/predictive_ranking.py) OU confiança baixa
-            # bloqueiam qualquer recomendação executiva de compra/priorização,
-            # independente do idioma.
+            # Trava determinística pós-LLM (core/llm_analysis.py): usa o tier REAL do
+            # ativo (classify_precedence_tier) para decidir se a recomendação
+            # executiva é suspensa - evidência insuficiente OU confiança baixa,
+            # independente do idioma. Isto é uma checagem DIFERENTE da separação
+            # categórica risco vs. oportunidade (que agora é garantida na origem,
+            # em core/predictive_ranking.py select_predictive_assets() - um ativo
+            # com sinal de risco nunca mais é elegível a "Estrela Emergente"/"Dark
+            # Horse", mesmo se não coube no teto de high_risk_count; corrigido em
+            # 2026-08-19, ver METHODOLOGY.md). item["predictive_category"] e
+            # classify_precedence_tier(item) já são consistentes para todo ativo
+            # selecionado desde essa correção - esta trava aqui cobre só o eixo
+            # evidência/confiança, não precisa mais reconferir risco.
             is_insufficient_data = (
                 ranking_engine.classify_precedence_tier(item) == TIER_INSUFFICIENT_DATA
                 or item["confianca_sinal"] == "BAIXA"
@@ -496,6 +506,17 @@ def main():
                     "industrial_traction": jurisdiction_assessment["tracao_industrial"],
                     "supply_risk": jurisdiction_assessment["risco_oferta"],
                     "confidence_level": jurisdiction_assessment["confianca_sinal"],
+                    # Rastreabilidade regulatória (obrigatória em toda entrada de
+                    # connectors/regulatory_comex.py REGULATORY_REGISTRY/EU_/FDA_,
+                    # ver RegulatoryRegistryTraceabilityError) - a jurisdição de
+                    # PIOR CASO (item_regulatory_matrix["max_severity_status"], a
+                    # mesma que decide risco_oferta/alerta_regulatorio acima), não
+                    # a jurisdição local do idioma do relatório. Exibida no PDF
+                    # como evidence-tag "REG: ..." (reports/pdf_generator.py),
+                    # para que a base/norma citada e a data da última confirmação
+                    # manual fiquem auditáveis fora do código-fonte.
+                    "regulatory_source": item_regulatory_matrix["max_severity_status"].get("source"),
+                    "regulatory_last_verified": item_regulatory_matrix["max_severity_status"].get("last_verified"),
                     "inovacao_pd": recs["inovacao_pd"],
                     "compras_procurement": recs["compras_procurement"],
                     "pmids": item["pmids"],
