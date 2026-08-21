@@ -9,6 +9,14 @@ _RANGE_MARGIN = 0.10
 _MILLION_SUFFIX = {"PT-BR": "Mi", "PT-PT": "Mi", "ES": "M"}
 _THOUSAND_SUFFIX = {"PT-BR": "mil", "PT-PT": "mil", "ES": "mil"}
 
+# Conjunção do intervalo ("Entre X ? Y") - CORRIGIDO (2026-08-20, achado de
+# auditoria de vazamento de português na prosa ES): estava hardcoded como "e"
+# (português) para os 3 idiomas: como este valor formatado é injetado
+# diretamente no prompt de core/llm_analysis.py generate_recommendations(), a
+# LLM frequentemente copiava o "e" literal para dentro da prosa em espanhol
+# (ex.: "Entre USD 1,0 M e USD 1,3 M") em vez do conectivo correto "y".
+_RANGE_CONJUNCTION = {"PT-BR": "e", "PT-PT": "e", "ES": "y"}
+
 
 def _format_magnitude(value: float, lang_key: str) -> str:
     if value >= 1_000_000:
@@ -43,7 +51,8 @@ def format_usd_estimate(value: Optional[int], lang: str = "PT-BR") -> str:
     low = value * (1 - _RANGE_MARGIN)
     high = value * (1 + _RANGE_MARGIN)
 
-    return f"Entre {_format_magnitude(low, lang_key)} e {_format_magnitude(high, lang_key)}"
+    conjunction = _RANGE_CONJUNCTION.get(lang_key, "e")
+    return f"Entre {_format_magnitude(low, lang_key)} {conjunction} {_format_magnitude(high, lang_key)}"
 
 
 if __name__ == "__main__":

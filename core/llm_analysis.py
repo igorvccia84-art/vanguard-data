@@ -12,6 +12,10 @@ import anthropic
 
 from core.formatting import format_usd_estimate
 from core.predictive_ranking import MIN_SCI_FOR_EMERGING_STAR, MIN_IND_FOR_EMERGING_STAR
+from connectors.regulatory_comex import (
+    localize_alerts, localize_max_concentration, localize_status,
+    localize_restriction_level, localize_trend
+)
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -19,6 +23,22 @@ if sys.stdout.encoding != 'utf-8':
 load_dotenv()
 
 MODEL_ID = "claude-sonnet-5"
+
+# Rótulo fixo prefixado ao texto de limitações dentro de inovacao_pd/
+# compras_procurement (_compose_recommendation_text) - CORRIGIDO (2026-08-20):
+# até aqui era um literal "Limitações:" hardcoded em português, nunca passava
+# pelo pipeline de localização - vazava para o relatório ES sem tradução
+# (achado de auditoria: aparecia em TODOS os blocos de ressalva do PDF
+# espanhol). Sistema de localização para os elementos fixos GERADOS DENTRO
+# desta engine (distinto de reports/pdf_generator.py TRANSLATIONS, que só
+# cobre o template/chrome do PDF em si - "Limitações:" nunca passava por lá,
+# porque já vem embutido no texto de inovacao_pd/compras_procurement quando
+# chega ao gerador de PDF).
+LIMITATIONS_LABEL = {
+    "PT-BR": "Limitações:",
+    "PT-PT": "Limitações:",
+    "ES": "Limitaciones:"
+}
 
 # Isolamento regulatório por idioma do relatório
 REGULATORY_BODY = {
@@ -52,13 +72,41 @@ REGION_CONTEXT = {
     }
 }
 
+# Tradução ES dos valores canônicos de Risco de Oferta/Confiança do Sinal
+# (core/score_engine.py) injetados no prompt de generate_recommendations -
+# CORRIGIDO (2026-08-20, mesmo achado de auditoria de vazamento em português
+# na prosa ES). PT-BR/PT-PT continuam recebendo o valor canônico original
+# (comportamento inalterado); só ES recebe o rótulo traduzido. Mesmos valores
+# de exibição de reports/pdf_generator.py (SUPPLY_RISK_LABELS/CONFIDENCE_LABELS),
+# reaproveitados aqui só para o texto ES por conveniência - não é uma
+# dependência do módulo de relatórios (core/ não deve depender de reports/).
+SUPPLY_RISK_LABEL_ES = {"ALTO RISCO": "RIESGO ALTO", "MEDIO RISCO": "RIESGO MEDIO", "BAIXO RISCO": "RIESGO BAJO"}
+CONFIDENCE_LABEL_ES = {"ALTA": "ALTA", "MÉDIA": "MEDIA", "BAIXA": "BAJA"}
+
+
 # Strict Grounding Directive: aplicada como system prompt em toda chamada ao LLM
 # desta engine. Contramedida direta contra alucinação - a IA deve se ater 100% ao
 # contexto fornecido na mensagem do usuário (abstracts de artigos, títulos de
 # patentes, métricas do assessment), nunca preenchendo lacunas com conhecimento
 # paramétrico ou suposições plausíveis.
-STRICT_GROUNDING_DIRECTIVE = """DIRETRIZ DE FUNDAMENTAÇÃO ESTRITA (Strict Grounding Directive):
+#
+# Por idioma - CORRIGIDO (2026-08-20, achado de auditoria: vazamento de
+# vocabulário técnico em português na prosa gerada para o relatório ES).
+# Antes desta correção, um único texto fixo em português era enviado como
+# system prompt para TODA chamada, mesmo quando o idioma de saída exigido no
+# prompt do usuário era espanhol - a cláusula (6) abaixo, em particular,
+# contém um EXEMPLO de frase entre aspas ("o sinal observado indica risco
+# elevado de oferta") que a LLM por vezes citava/adaptava quase literalmente
+# na resposta em espanhol (raiz mais provável do achado "Sinal de Risco de
+# Oferta" aparecendo sem tradução no relatório ES). PT-BR e PT-PT reaproveitam
+# o mesmo texto (idioma idêntico); ES tem tradução própria completa, não uma
+# cópia adaptada. Cláusula (0), nova nas 3 versões, reforça explicitamente a
+# pureza de idioma da resposta - complementar à instrução de idioma de saída
+# do prompt do usuário (ver generate_recommendations()), não um substituto.
+STRICT_GROUNDING_DIRECTIVE = {
+    "PT-BR": """DIRETRIZ DE FUNDAMENTAÇÃO ESTRITA (Strict Grounding Directive):
 Você é um analista que trabalha exclusivamente com os dados fornecidos na mensagem do usuário. É terminantemente proibido:
+(0) escrever qualquer parte da resposta em um idioma diferente do idioma de saída exigido explicitamente na mensagem do usuário - mesmo que o contexto fornecido contenha trechos em outro idioma, a resposta inteira deve permanecer no idioma exigido, sem misturar vocabulário técnico de outro idioma;
 (1) inventar, extrapolar ou presumir números, percentuais, dosagens, resultados estatísticos ou qualquer dado quantitativo que não esteja explicitamente presente no contexto fornecido;
 (2) inventar mecanismos de ação, vias bioquímicas ou processos farmacológicos não mencionados no contexto fornecido;
 (3) inventar aplicações, indicações de uso, benefícios, estudos, autores ou publicações que não constem explicitamente no contexto fornecido;
@@ -66,7 +114,20 @@ Você é um analista que trabalha exclusivamente com os dados fornecidos na mens
 (5) atribuir dados financeiros, de volume de mercado ou de comércio exterior a uma base regulatória (ex.: CosIng/ECHA) - bases regulatórias só podem ser citadas para status regulatório, funções cosméticas e restrições legais;
 (6) apresentar o Risco de Oferta como um fato certo e definitivo - trate-o sempre como um sinal observado a partir dos dados disponíveis (ex.: "o sinal observado indica risco elevado de oferta"), nunca como uma previsão garantida;
 (7) tratar a ausência de patente recente no contexto fornecido como prova de baixo interesse industrial - depósitos dos últimos 18 meses podem estar sob sigilo legal (ainda não publicados) e não aparecem nas buscas públicas.
-Toda afirmação factual da sua resposta deve ser rastreável a um trecho específico do contexto fornecido nesta mensagem. Se o contexto fornecido for insuficiente, incompleto ou ausente para sustentar uma afirmação, declare essa limitação explicitamente em vez de preencher a lacuna com suposições ou conhecimento geral."""
+Toda afirmação factual da sua resposta deve ser rastreável a um trecho específico do contexto fornecido nesta mensagem. Se o contexto fornecido for insuficiente, incompleto ou ausente para sustentar uma afirmação, declare essa limitação explicitamente em vez de preencher a lacuna com suposições ou conhecimento geral.""",
+    "ES": """DIRECTRIZ DE FUNDAMENTACIÓN ESTRICTA (Strict Grounding Directive):
+Eres un analista que trabaja exclusivamente con los datos proporcionados en el mensaje del usuario. Está terminantemente prohibido:
+(0) escribir cualquier parte de la respuesta en un idioma distinto al idioma de salida exigido explícitamente en el mensaje del usuario - incluso si el contexto proporcionado contiene fragmentos en otro idioma (por ejemplo, portugués), toda la respuesta debe permanecer en el idioma exigido, sin mezclar vocabulario técnico de otro idioma;
+(1) inventar, extrapolar o presumir números, porcentajes, dosis, resultados estadísticos o cualquier dato cuantitativo que no esté explícitamente presente en el contexto proporcionado;
+(2) inventar mecanismos de acción, vías bioquímicas o procesos farmacológicos no mencionados en el contexto proporcionado;
+(3) inventar aplicaciones, indicaciones de uso, beneficios, estudios, autores o publicaciones que no consten explícitamente en el contexto proporcionado;
+(4) inventar, completar, corregir o citar por cuenta propia cualquier PMID, número de patente o código identificador - solo puedes citar un PMID o número de patente si aparece literalmente, carácter por carácter, en el contexto proporcionado en este mensaje; si no tienes certeza absoluta de un identificador, no lo menciones;
+(5) atribuir datos financieros, de volumen de mercado o de comercio exterior a una base regulatoria (ej.: CosIng/ECHA) - las bases regulatorias solo pueden citarse para estado regulatorio, funciones cosméticas y restricciones legales;
+(6) presentar el Riesgo de Oferta como un hecho cierto y definitivo - trátalo siempre como una señal observada a partir de los datos disponibles (ej.: "la señal observada indica riesgo elevado de oferta"), nunca como una predicción garantizada;
+(7) tratar la ausencia de patente reciente en el contexto proporcionado como prueba de bajo interés industrial - los depósitos de los últimos 18 meses pueden estar bajo secreto legal (aún no publicados) y no aparecen en las búsquedas públicas.
+Toda afirmación factual de tu respuesta debe ser rastreable a un fragmento específico del contexto proporcionado en este mensaje. Si el contexto proporcionado es insuficiente, incompleto o ausente para sustentar una afirmación, declara esa limitación explícitamente en vez de llenar el vacío con suposiciones o conocimiento general.""",
+}
+STRICT_GROUNDING_DIRECTIVE["PT-PT"] = STRICT_GROUNDING_DIRECTIVE["PT-BR"]
 
 # Schema de saída estruturada de generate_recommendations(): cada recomendação
 # (inovacao_pd/compras_procurement) é decomposta em 'claim' (a recomendação
@@ -366,7 +427,10 @@ Responda apenas com o resumo, sem introduções ou comentários adicionais."""
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=1024,
-                system=STRICT_GROUNDING_DIRECTIVE,
+                # summarize_evidence() sempre resume em português (ver prompt
+                # acima), independente do idioma do relatório final - usa
+                # sempre a versão PT-BR da diretiva.
+                system=STRICT_GROUNDING_DIRECTIVE["PT-BR"],
                 messages=[{"role": "user", "content": prompt}]
             )
         except anthropic.APIStatusError as e:
@@ -434,17 +498,95 @@ Responda apenas com o resumo, sem introduções ou comentários adicionais."""
         region = REGION_CONTEXT.get(lang_key, REGION_CONTEXT["PT-BR"])
         regulatory_alerts = regulatory_alerts or {}
         commercial_signals = commercial_signals or {}
-        alerts_text = "; ".join(regulatory_alerts.get("alerts") or []) or "nenhum alerta específico registrado"
 
         evidence_ids_hint = ", ".join((pmids or []) + (patent_ids or [])) or "nenhum"
 
-        confidence_instruction = (
-            "- O ativo tem evidência de Nível 2/3 (sinal tópico/aplicado ou de produto/formulação confirmado): pode usar um framing de confiança normal, sempre ancorado nos dados fornecidos."
-            if high_confidence else
-            "- ATENÇÃO: este ativo só tem evidência de Nível 1 (mera correspondência de nome, sem sinal tópico/aplicado confirmado) ou evidência insuficiente. NÃO escreva uma recomendação de alta confiança. O 'claim' deve ser explicitamente conservador (ex.: \"evidência preliminar sugere...\", \"ainda não é possível recomendar com confiança...\"), e 'limitations' DEVE declarar que a evidência disponível não passa do Nível 1/insuficiente para uma recomendação de alta confiança."
-        )
+        if lang_key == "ES":
+            # Prompt ES ÍNTEGRO (não uma tradução de rótulos isolados sobre um
+            # template em português) - CORRIGIDO (2026-08-20, achado de
+            # auditoria: vazamento de vocabulário técnico em português na
+            # prosa gerada para o relatório ES). Antes desta correção, só os
+            # VALORES de dado eram trocados por idioma (ex.: assessment.get(...)),
+            # mas todo o texto estático do prompt (cabeçalhos de seção,
+            # ressalvas, instruções) permanecia fixo em português mesmo para
+            # ES - o prompt inteiro era majoritariamente português, com uma
+            # única instrução de idioma perdida no meio do texto ('no idioma
+            # "{lang}"'), insuficiente para impedir a LLM de copiar/adaptar
+            # vocabulário técnico do restante do prompt (achados reais:
+            # "rotulagem", "código alfandegário", "Sinal de Risco de Oferta").
+            # Os valores de dado injetados abaixo (status/nível de
+            # restrição/tendência/alertas/concentração máxima/Risco de
+            # Oferta/Confiança do Sinal) também são traduzidos antes de entrar
+            # no prompt (localize_* de connectors/regulatory_comex.py e
+            # SUPPLY_RISK_LABEL_ES/CONFIDENCE_LABEL_ES acima) - nunca mais o
+            # valor canônico em português cru.
+            alerts_es = localize_alerts(regulatory_alerts.get("alerts"), lang_key)
+            alerts_text = "; ".join(alerts_es) or "ninguna alerta específica registrada"
+            status_es = localize_status(regulatory_alerts.get("status"), lang_key) or "N/A"
+            restriction_level_es = localize_restriction_level(regulatory_alerts.get("restriction_level"), lang_key) or "N/A"
+            max_concentration_es = localize_max_concentration(regulatory_alerts.get("max_concentration_allowed"), lang_key) or "N/A"
+            trend_es = localize_trend(commercial_signals.get("trend"), lang_key) or "N/A"
+            risco_oferta_raw = assessment.get("risco_oferta")
+            risco_oferta_es = SUPPLY_RISK_LABEL_ES.get(risco_oferta_raw, risco_oferta_raw)
+            confianca_raw = assessment.get("confianca_sinal")
+            confianca_es = CONFIDENCE_LABEL_ES.get(confianca_raw, confianca_raw)
 
-        prompt = f"""Você é um consultor estratégico de P&D e Procurement para a indústria dermocosmética, especializado no mercado de {region['market_label']}.
+            confidence_instruction_es = (
+                "- El activo tiene evidencia de Nivel 2/3 (señal tópica/aplicada o de producto/formulación confirmada): puedes usar un enfoque de confianza normal, siempre anclado en los datos proporcionados."
+                if high_confidence else
+                "- ATENCIÓN: este activo solo tiene evidencia de Nivel 1 (mera coincidencia de nombre, sin señal tópica/aplicada confirmada) o evidencia insuficiente. NO escribas una recomendación de alta confianza. El 'claim' debe ser explícitamente conservador (ej.: \"la evidencia preliminar sugiere...\", \"aún no es posible recomendar con confianza...\"), y 'limitations' DEBE declarar que la evidencia disponible no supera el Nivel 1/insuficiente para una recomendación de alta confianza."
+            )
+
+            prompt = f"""INSTRUCCIÓN DE IDIOMA (máxima prioridad, léela antes que el resto): toda tu respuesta ('claim' y 'limitations' de ambos campos) debe estar escrita ÍNTEGRAMENTE en español de España. No uses ninguna palabra en portugués, incluso si el contexto de abajo contiene texto en portugués (por ejemplo, algún dato sin traducir) - tradúcelo siempre al español antes de usarlo en tu respuesta.
+
+Eres un consultor estratégico de I+D y Procurement para la industria dermocosmética, especializado en el mercado de {region['market_label']}.
+
+Activo: {canonical_name}
+
+MÉTRICAS GLOBALES (basadas en evidencia científica/industrial - las mismas en cualquier mercado):
+Tracción Científica: {assessment.get('tracao_cientifica')}
+Tracción Industrial: {assessment.get('tracao_industrial')}
+Confianza de la Señal: {confianca_es}
+
+DATOS ESPECÍFICOS DEL MERCADO OBJETIVO ({region['market_label']} / {region['region_code']}) - úsalos para diferenciar este análisis de cualquier otra región:
+Marco regulatorio aplicable: {region['regulatory_framework']}
+Organismo regulatorio de referencia: {regulatory_body}
+Estado regulatorio local: {status_es} (nivel de restricción: {restriction_level_es})
+Concentración máxima permitida para uso tópico en esta jurisdicción: {max_concentration_es}
+Alertas regulatorias específicas de esta jurisdicción: {alerts_text}
+Fuente de datos de suministro/comercio: {region['trade_data_label']}
+Proveedores mapeados en esta región: {commercial_signals.get('suppliers_count', 'N/A')}
+Tendencia de oferta en esta región: {trend_es}
+Volumen anual estimado (USD, rango redondeado) en esta región: {format_usd_estimate(commercial_signals.get('volume_usd_annual'), lang=lang_key)}
+Señal de Riesgo de Oferta Observada (regulatoria + comercial) para {region['market_label']}: {risco_oferta_es}
+
+ADVERTENCIAS OBLIGATORIAS (tenlas en cuenta al escribir claim/limitations):
+- Los valores comerciales anteriores reflejan el volumen declarado en el código arancelario analizado y pueden incluir otros insumos además de este activo específicamente.
+- Las señales industriales (patentes) se basan en publicaciones públicas; los depósitos de los últimos 18 meses pueden estar bajo secreto legal y no aparecer en esta búsqueda.
+
+IDs DE EVIDENCIA DISPONIBLES PARA CITAR (no inventes otros; usa string vacío/array vacío si ninguno aplica a una recomendación específica): {evidence_ids_hint}
+
+INSTRUCCIONES OBLIGATORIAS:
+- Responde en el formato estructurado exigido: para cada recomendación, completa 'claim' (la recomendación en sí, corta y accionable, 2-3 frases, ESCRITA ÍNTEGRAMENTE EN ESPAÑOL), 'evidence_ids' (solo IDs de la lista anterior que sustenten directamente esta recomendación) y 'limitations' (lo que la evidencia disponible NO cubre para esta recomendación).
+- Las recomendaciones deben reflejar especificidades REALES del marco regulatorio y de la dinámica de suministro de {region['market_label']} indicados arriba: cita el marco regulatorio y/o la alerta específica al justificar el 'claim' de Innovación & I+D, y cita los datos de proveedores/tendencia al justificar el de Compras & Procurement.
+- NO escribas un 'claim' genérico que sirva igualmente para otro mercado. El texto debe ser claramente distinguible de lo que se escribiría para otra región, incluso cuando las métricas globales sean idénticas.
+- NUNCA respondas con un placeholder genérico (ej.: "placeholder", "N/A", "TBD", "por definir") en 'claim'. Incluso con evidencia científica limitada, produce siempre una frase real y específica basada en los datos regulatorios/comerciales proporcionados arriba, y declara la limitación en 'limitations' en vez de inflar el 'claim'.
+{confidence_instruction_es}
+
+1. Una recomendación para el equipo de Innovación & I+D (campo inovacao_pd).
+2. Una recomendación para el equipo de Compras & Procurement (campo compras_procurement).
+
+Responde únicamente con el JSON estructurado. No incluyas comentarios sobre el proceso de generación, marcadores de conclusión (ej.: "fin", "concluido", "listo") ni ningún texto después del JSON — detente en cuanto el contenido esté completo. Recuerda: toda tu respuesta debe estar en español, nunca en portugués."""
+        else:
+            alerts_text = "; ".join(regulatory_alerts.get("alerts") or []) or "nenhum alerta específico registrado"
+
+            confidence_instruction = (
+                "- O ativo tem evidência de Nível 2/3 (sinal tópico/aplicado ou de produto/formulação confirmado): pode usar um framing de confiança normal, sempre ancorado nos dados fornecidos."
+                if high_confidence else
+                "- ATENÇÃO: este ativo só tem evidência de Nível 1 (mera correspondência de nome, sem sinal tópico/aplicado confirmado) ou evidência insuficiente. NÃO escreva uma recomendação de alta confiança. O 'claim' deve ser explicitamente conservador (ex.: \"evidência preliminar sugere...\", \"ainda não é possível recomendar com confiança...\"), e 'limitations' DEVE declarar que a evidência disponível não passa do Nível 1/insuficiente para uma recomendação de alta confiança."
+            )
+
+            prompt = f"""Você é um consultor estratégico de P&D e Procurement para a indústria dermocosmética, especializado no mercado de {region['market_label']}.
 
 Ativo: {canonical_name}
 
@@ -493,7 +635,7 @@ Responda apenas com o JSON estruturado. Não inclua comentários sobre o process
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=4096,
-                    system=STRICT_GROUNDING_DIRECTIVE,
+                    system=STRICT_GROUNDING_DIRECTIVE.get(lang_key, STRICT_GROUNDING_DIRECTIVE["PT-BR"]),
                     output_config={"format": {"type": "json_schema", "schema": RECOMMENDATION_SCHEMA}},
                     messages=[{"role": "user", "content": prompt}]
                 )
@@ -514,10 +656,10 @@ Responda apenas com o JSON estruturado. Não inclua comentários sobre o process
                 continue
 
             last_inovacao = self._compose_recommendation_text(
-                parsed.get("inovacao_pd", {}), pmids, patent_ids, canonical_name, "inovacao_pd"
+                parsed.get("inovacao_pd", {}), pmids, patent_ids, canonical_name, "inovacao_pd", lang_key
             )
             last_compras = self._compose_recommendation_text(
-                parsed.get("compras_procurement", {}), pmids, patent_ids, canonical_name, "compras_procurement"
+                parsed.get("compras_procurement", {}), pmids, patent_ids, canonical_name, "compras_procurement", lang_key
             )
 
             if not _is_degenerate_text(last_inovacao) and not _is_degenerate_text(last_compras):
@@ -543,7 +685,8 @@ Responda apenas com o JSON estruturado. Não inclua comentários sobre o process
         pmids: List[str],
         patent_ids: List[str],
         canonical_name: str,
-        field_label: str
+        field_label: str,
+        lang_key: str
     ) -> str:
         """
         Converte um bloco estruturado {claim, evidence_ids, limitations}
@@ -566,7 +709,8 @@ Responda apenas com o JSON estruturado. Não inclua comentários sobre o process
         )
 
         if not _is_degenerate_text(limitations):
-            return f"{claim} Limitações: {limitations}"
+            label = LIMITATIONS_LABEL.get(lang_key, LIMITATIONS_LABEL["PT-BR"])
+            return f"{claim} {label} {limitations}"
         return claim
 
 

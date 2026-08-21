@@ -151,10 +151,12 @@ def main():
 
             # PubMed: aplica as exclusões do ativo diretamente na query, restringe à janela de 15
             # dias (data de publicação), recebe PMIDs + query_hash. Estes são os PMIDs de
-            # "novidade" exibidos no relatório - só os que passam pela validação determinística
-            # obrigatória pré-relatório (connectors/pubmed_validator.py: existe no NCBI E a
-            # entidade do ativo é confirmada no título/resumo) chegam ao PDF. Qualquer PMID
-            # rejeitado é descartado nesta camada, nunca chega à síntese da LLM.
+            # "novidade" (o mais recente possível) - só os que passam pela validação
+            # determinística obrigatória pré-relatório (connectors/pubmed_validator.py: existe
+            # no NCBI E a entidade do ativo é confirmada no título/resumo) entram na lista final.
+            # Qualquer PMID rejeitado é descartado nesta camada, nunca chega à síntese da LLM.
+            # NUNCA a única fonte de PMIDs citados no relatório - ver comentário em
+            # "PubMed (Tração)" abaixo (achado de auditoria 2026-08-20).
             pubmed_search = pubmed_conn.search_articles(search_query, exclusions=exclusions, max_results=5)
             verified_pmids, rejected_pmids = pmid_validator.validate_batch(pubmed_search["pmids"], canonical_name)
             if rejected_pmids:
@@ -173,8 +175,26 @@ def main():
                 period_end = pubmed_search["date_range"]["end"]
 
             # PubMed (Tração): segunda busca sobre a janela histórica móvel de 12 meses
-            # (TRACTION_WINDOW_DAYS) - usada exclusivamente para calcular Tração Científica
-            # (core/score_engine.py), nunca para exibir PMIDs de novidade no relatório.
+            # (TRACTION_WINDOW_DAYS) - usada para calcular Tração Científica (core/score_engine.py).
+            #
+            # CORRIGIDO (2026-08-20, achado de auditoria - regressão introduzida no commit
+            # 5723fe6 "chore(backup): backup automatizado - 2026-08-18 00:19", quando esta janela
+            # de 12 meses foi introduzida): até aquele commit, uma única busca alimentava tanto o
+            # cálculo do score quanto a lista de PMIDs citada no relatório - as duas nunca podiam
+            # divergir. Ao introduzir a janela de tração separada, o INPUT do score foi trocado
+            # para `pubmed_traction_results` (linha abaixo), mas a lista citada no relatório
+            # ('pmids', mais abaixo neste laço) continuou vindo só da busca de novidade de 15 dias
+            # acima - nunca atualizada para refletir a nova fonte real do score. Resultado: um
+            # ativo podia ter evidência real e verificada por trás de Tração Científica/Industrial
+            # sem NENHUM PMID/patente aparecer no relatório final, porque a janela de 15 dias
+            # simplesmente não capturava os mesmos artigos/patentes da janela de 12 meses (caso
+            # real: Calendula/AT-017, ver docs/calculation_trace_calendula_2026-08-19.md - T_c/T_i
+            # calculados a partir de 2 PMIDs + 2 patentes verificados, relatório dizendo "nenhuma
+            # evidência disponível"). A lista final de PMIDs/patentes citados no relatório (mais
+            # abaixo neste laço) agora é a UNIÃO dos dois: novidade de 15 dias (verified_pmids/
+            # valid_patent_ids acima) + evidência real da janela de 12 meses que efetivamente
+            # entrou na fórmula (score_engine.extract_verified_pmids()/extract_traction_patent_ids(),
+            # abaixo) - nunca mais só a novidade recente.
             pubmed_traction_search = pubmed_conn.search_articles(
                 search_query, exclusions=exclusions, max_results=10, days=pubmed_conn.TRACTION_WINDOW_DAYS
             )
@@ -268,6 +288,16 @@ def main():
                 baseline_36m_count=pubmed_baseline_search["count"]
             )
 
+            # PMIDs/patentes citados no relatório final: união entre a novidade de 15 dias
+            # (verified_pmids/valid_patent_ids) e a evidência real que efetivamente entrou na
+            # fórmula de T_c/T_i (janela de 12 meses) - ver comentário longo em "PubMed (Tração)"
+            # acima para a causa raiz da regressão corrigida aqui. dict.fromkeys() deduplica
+            # preservando a ordem (um mesmo PMID/patente pode aparecer nas duas janelas).
+            traction_pmids = score_engine.extract_verified_pmids(pubmed_traction_results)
+            traction_patent_ids = score_engine.extract_traction_patent_ids(patent_traction_results)
+            cited_pmids = list(dict.fromkeys(verified_pmids + traction_pmids))
+            cited_patent_ids = list(dict.fromkeys(valid_patent_ids + traction_patent_ids))
+
             # Persistência auditável: avaliação do ativo + fontes de evidência (evaluation_evidence_sources)
             evaluation_id = db_manager.save_evaluation(
                 run_id, asset_id, canonical_name, assessment, domain_code="DERMOCOSMETICS"
@@ -321,10 +351,13 @@ def main():
                 f"Risco={assessment['risco_oferta']:<12} "
                 f"Confianca={assessment['confianca_sinal']}"
             )
+            if cited_pmids or cited_patent_ids:
+                print(f"    [EVID] {asset_id} - evidência citável no relatório final: {cited_pmids} {cited_patent_ids}")
 
             all_evaluations.append({
                 "asset_id": asset_id,
                 "canonical_name": canonical_name,
+                "canonical_name_es": asset.get("canonical_name_es"),
                 "tracao_cientifica": assessment["tracao_cientifica"],
                 "tracao_cientifica_componentes": assessment["tracao_cientifica_componentes"],
                 "tracao_industrial": assessment["tracao_industrial"],
@@ -336,8 +369,8 @@ def main():
                 "nivel_evidencia_maximo": assessment["nivel_evidencia_maximo"],
                 "pubmed_raw_count_12m": pubmed_traction_search["count"],
                 "tem_exclusoes": bool(exclusions),
-                "pmids": verified_pmids,
-                "patent_ids": valid_patent_ids,
+                "pmids": cited_pmids,
+                "patent_ids": cited_patent_ids,
                 "hs_code": hs_code,
                 "pubmed_baseline_count": pubmed_baseline_search["count"],
                 "_pubmed_traction_results": pubmed_traction_results,
@@ -457,6 +490,24 @@ def main():
             item_regulatory_matrix = comex_conn.get_regulatory_matrix(asset_id)
 
             for lang in languages_to_generate:
+                # Nome canônico LOCALIZADO por idioma do relatório - CORRIGIDO
+                # (2026-08-20): antes, o mesmo canonical_name em português era
+                # reaproveitado para os 3 idiomas, tanto na tabela quanto no
+                # prompt da LLM. A LLM às vezes "acertava" a tradução na prosa
+                # por conhecimento próprio (ex.: "Ácido Tranexâmico" ->
+                # "Tranexámico"), mas não de forma confiável (ex.: "Alcaçuz"
+                # nunca virava "Regaliz", nem na tabela nem no texto gerado) -
+                # dependia do quão internacionalmente padronizado o termo era,
+                # não de uma tradução garantida. Usar canonical_name_es (taxonomia,
+                # data/taxonomy/ativos_mvp.json) tanto na tabela quanto no
+                # próprio prompt elimina a dependência de tradução implícita da
+                # LLM. Sem override = nome já é válido/idêntico em espanhol
+                # (confirmado ativo a ativo - ver METHODOLOGY.md).
+                localized_canonical_name = (
+                    item.get("canonical_name_es") if lang.upper() == "ES" and item.get("canonical_name_es")
+                    else canonical_name
+                )
+
                 # Dossiê regulatório/comex específico da jurisdição do idioma do relatório -
                 # usado para a narrativa regional da LLM (generate_recommendations), não para
                 # o score da tabela, que usa o pior caso cross-jurisdição (ver abaixo).
@@ -488,7 +539,7 @@ def main():
                 # core/llm_analysis.py generate_recommendations).
                 high_confidence = jurisdiction_assessment["nivel_evidencia_maximo"] >= 2
                 recs = llm_engine.generate_recommendations(
-                    canonical_name, assessment_view,
+                    localized_canonical_name, assessment_view,
                     regulatory_alerts=jurisdiction_dossier["alertas_regulatorios"],
                     commercial_signals=jurisdiction_dossier["sinais_comerciais_comex"],
                     lang=lang,
@@ -500,7 +551,7 @@ def main():
 
                 evaluations_by_lang[lang].append({
                     "asset_id": asset_id,
-                    "canonical_name": canonical_name,
+                    "canonical_name": localized_canonical_name,
                     "predictive_category": item["predictive_category"],
                     "scientific_traction": jurisdiction_assessment["tracao_cientifica"],
                     "industrial_traction": jurisdiction_assessment["tracao_industrial"],

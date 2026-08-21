@@ -112,6 +112,21 @@ def main():
     )
     print(f"Assessment real: {assessment['tracao_cientifica']} / {assessment['tracao_industrial']} / {assessment['confianca_sinal']}")
 
+    # PMIDs/patentes citados no PDF de auditoria: união entre a novidade de 15
+    # dias (verified_pmids/valid_patent_ids, mais abaixo) e a evidência real
+    # que efetivamente entrou na fórmula de T_c/T_i (janela de 12 meses) -
+    # MESMA correção aplicada em main.py (achado de auditoria 2026-08-20: este
+    # script tinha o mesmo bug, citando só a novidade de 15 dias e por isso
+    # podendo declarar "nenhuma evidência disponível" para um ativo cujo score
+    # foi calculado a partir de evidência real da janela de 12 meses - ver
+    # comentário longo em main.py, "PubMed (Tração)", para a causa raiz
+    # completa). extract_verified_pmids()/extract_traction_patent_ids()
+    # (core/score_engine.py) são a MESMA fonte usada pela própria fórmula
+    # internamente - nunca uma extração reimplementada à parte aqui, para as
+    # duas nunca mais poderem divergir silenciosamente.
+    traction_pmids = score_engine.extract_verified_pmids(pubmed_traction_results)
+    traction_patent_ids = score_engine.extract_traction_patent_ids(patent_traction_results)
+
     evaluation = {
         "asset_id": asset_id, "canonical_name": canonical_name,
         "tracao_cientifica": assessment["tracao_cientifica"], "tracao_industrial": assessment["tracao_industrial"],
@@ -126,6 +141,13 @@ def main():
     valid_patent_ids, rejected_patents = patent_conn.validate_patent_batch(patent_ids_candidates, canonical_name)
     print(f"Patentes candidatas: {patent_ids_candidates} | Validadas: {valid_patent_ids}")
 
+    # União final (mesma lógica de main.py 'cited_pmids'/'cited_patent_ids'):
+    # novidade de 15 dias + evidência real da janela de 12 meses que entrou na
+    # fórmula. dict.fromkeys() deduplica preservando a ordem.
+    cited_pmids = list(dict.fromkeys(verified_pmids + traction_pmids))
+    cited_patent_ids = list(dict.fromkeys(valid_patent_ids + traction_patent_ids))
+    print(f"Evidência citável no relatório de auditoria (união 15d + tração 12m): {cited_pmids} {cited_patent_ids}")
+
     # ---- Trava pós-LLM real (mesma condição de main.py Fase 3) ----
     is_insufficient_data = (
         ranking_engine.classify_precedence_tier(evaluation) == TIER_INSUFFICIENT_DATA
@@ -136,7 +158,7 @@ def main():
     recs = llm_engine.generate_recommendations(
         canonical_name, assessment, regulatory_alerts=dossier["alertas_regulatorios"],
         commercial_signals=dossier["sinais_comerciais_comex"], lang=LANG,
-        pmids=verified_pmids, patent_ids=valid_patent_ids,
+        pmids=cited_pmids, patent_ids=cited_patent_ids,
         high_confidence=assessment["nivel_evidencia_maximo"] >= 2, is_insufficient_data=is_insufficient_data
     )
     print(f"Recomendação Inovação & P&D: {recs['inovacao_pd']}")
@@ -146,7 +168,7 @@ def main():
            "supply_risk": assessment["risco_oferta"], "confidence_level": assessment["confianca_sinal"],
            "regulatory_source": regulatory_alerts.get("source"), "regulatory_last_verified": regulatory_alerts.get("last_verified"),
            "inovacao_pd": recs["inovacao_pd"], "compras_procurement": recs["compras_procurement"],
-           "pmids": verified_pmids, "patent_ids": valid_patent_ids}
+           "pmids": cited_pmids, "patent_ids": cited_patent_ids}
 
     from core.score_engine import get_display_jurisdictions
     pdf_path = pdf_generator.generate_report(

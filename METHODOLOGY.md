@@ -761,6 +761,173 @@ depósito de patente; revisar com a mesma frequência seria esforço
 desproporcional ao ritmo real de mudança da fonte. Próxima revisão
 semestral agendada: 2027-02-20.
 
+## ✅ CORRIGIDO (2026-08-20): Vazamento de português no relatório ES (3 pontos, sistêmico)
+
+**O achado:** revisão do relatório ES gerado encontrou português vazando em
+3 lugares distintos, apesar do texto gerado pela LLM estar corretamente
+traduzido — sinal de que os 3 vinham de fontes FIXAS que nunca passavam
+pelo pipeline de localização (a LLM só traduz o que ela mesma gera; texto
+que chega pronto de outra fonte e é inserido direto no relatório não passa
+por tradução nenhuma, a menos que o código explicitamente busque a versão
+certa por idioma):
+
+1. **Rótulo "Limitações:"** — hardcoded em português em TODOS os blocos de
+   ressalva do documento espanhol (Inovação & P&D e Compras &
+   Procurement), literal fixo em `core/llm_analysis.py`
+   `_compose_recommendation_text()`.
+2. **Disclaimer "REG: ..."** — o texto de `source` (rastreabilidade do
+   `REGULATORY_REGISTRY`, introduzida na correção anterior) aparecia em
+   português nos 3 ativos High-Risk do relatório ES, porque é dado que
+   chega PRONTO ao gerador de PDF e é inserido direto na evidence-tag, sem
+   passar pela LLM (ao contrário de `alerts`, que só chega ao leitor via
+   prosa já traduzida pela síntese da LLM).
+3. **Nomes de ativos não localizados** — "Alcaçuz" nunca virava "Regaliz"
+   (nem na tabela, nem no corpo do texto); "Ácido Tranexâmico" na tabela
+   usava grafia portuguesa (â) enquanto o corpo do texto, no MESMO PDF,
+   usava corretamente "Tranexámico" (á, espanhol) — prova de que a tabela e
+   o texto narrativo vinham de fontes diferentes (`canonical_name`, campo
+   único da taxonomia, reaproveitado nos 3 idiomas, vs. a LLM traduzindo por
+   conta própria, com sucesso desigual conforme o termo já era ou não
+   internacionalmente padronizado).
+
+### Correção 1 — "Limitações:" → `LIMITATIONS_LABEL` por idioma
+
+**Onde:** `core/llm_analysis.py` `LIMITATIONS_LABEL` (novo dict, mesmo
+padrão de `REGULATORY_BODY`/`REGION_CONTEXT` já existentes no arquivo) +
+`_compose_recommendation_text()`, que agora recebe `lang_key` e busca o
+rótulo certo (`"Limitações:"` PT-BR/PT-PT, `"Limitaciones:"` ES) em vez do
+literal fixo.
+
+**Por que não em `reports/pdf_generator.py` TRANSLATIONS:** esse dict já
+existe e já cobre os elementos fixos do TEMPLATE do PDF (títulos de seção,
+cabeçalhos de tabela, rótulos de coluna — confirmado, sistema de
+localização de chrome do relatório já existia). "Limitações:" não é chrome
+do template — é montado DENTRO do texto de `inovacao_pd`/`compras_procurement`
+em `core/llm_analysis.py`, antes mesmo de chegar ao gerador de PDF, então
+precisa de sua própria entrada de localização nesse módulo.
+
+### Correção 2 — Disclaimer REG → `localize_source()` + `SOURCE_TRANSLATIONS`
+
+**Onde:** `connectors/regulatory_comex.py` `SOURCE_TRANSLATIONS` (10
+strings distintas — o número real de valores únicos de `source` nas 49
+entradas das 3 bases, dado o reaproveitamento de templates genéricos) +
+`localize_source(source_pt, lang)`, chamada por
+`reports/pdf_generator.py` ao montar a evidence-tag REG.
+
+**Validação estendida:** `_validate_regulatory_registries()` (a mesma
+função que já falha a importação do módulo se `source`/`last_verified`
+estiverem ausentes) agora TAMBÉM falha se o `source` de qualquer entrada
+não tiver uma tradução ES registrada em `SOURCE_TRANSLATIONS` — uma
+entrada nova com um `source` inédito, sem tradução, derruba a importação
+do pacote inteiro em vez de vazar em português silenciosamente. Fail-loud
+também em tempo de renderização: se `localize_source()` for chamada com um
+texto sem tradução cadastrada (não deveria acontecer, dado o passo
+anterior, mas defesa em profundidade), retorna
+`"[TRADUÇÃO ES AUSENTE] {texto original}"` em vez de expor português sem
+nenhum aviso.
+
+**Sobre PT-PT (verificado, não assumido):** o texto de `source` já está em
+português — que é o idioma de PT-PT também — então não há vazamento de
+IDIOMA para PT-PT (diferente de ES). Existe, sim, uma questão distinta de
+PROVENIÊNCIA: para 28 dos 35 ativos (os que não têm entrada em
+`EU_REGULATORY_OVERRIDES`), o relatório PT-PT cai no fallback da base
+Anvisa/Brasil, que às vezes cita explicitamente "RDC" (Resolução da
+Diretoria Colegiada, um instrumento regulatório BRASILEIRO) num relatório
+de Portugal. Isso é uma inconsistência de conteúdo/jurisdição, não de
+tradução — registrada aqui para decisão separada, não corrigida nesta
+rodada (fora do escopo do vazamento de idioma reportado).
+
+### Correção 3 — Nomes de ativos: `canonical_name_es` na taxonomia
+
+**Onde vem o nome canônico da tabela:** `data/taxonomy/ativos_mvp.json`,
+campo `canonical_name` — um valor ÚNICO por ativo, lido diretamente em
+`main.py` (`canonical_name = asset["canonical_name"]`) e reaproveitado nos
+3 idiomas, tanto na tabela quanto no próprio PROMPT enviado à LLM (por
+isso a LLM às vezes "acertava" a tradução na prosa por conhecimento
+próprio — ex.: termos farmacêuticos internacionalmente padronizados como
+"ácido tranexâmico" — e às vezes não, para nomes vernaculares menos
+padronizados como "Alcaçuz").
+
+**Correção:** novo campo opcional `canonical_name_es` na taxonomia,
+adicionado a **14 dos 35 ativos** do catálogo (varredura completa dos 35,
+não só os 4 que apareciam no relatório revisado — resultado abaixo).
+`main.py` agora calcula um `localized_canonical_name` por idioma dentro do
+laço de geração (usa `canonical_name_es` quando `lang=="ES"` e o campo
+existe; senão usa o `canonical_name` base) e passa esse nome tanto para a
+tabela (`evaluations_by_lang[lang]`) quanto para o PROMPT da LLM
+(`generate_recommendations`) — a LLM deixa de precisar adivinhar/traduzir o
+nome por conta própria.
+
+**Varredura completa dos 35 ativos** (script ad-hoc, revisão manual
+termo a termo — nenhuma tradução nova inventada sem confiança razoável;
+nomes internacionais/binomiais latinos mantidos como estão, por serem já
+válidos/neutros em espanhol):
+
+| Categoria | Ativos | Ação |
+|---|---:|---|
+| Já idêntico ou válido em ES sem alteração (ex.: Resveratrol, Centella Asiática, Cúrcuma, Ácido Glicólico) | 21 | Nenhuma - `canonical_name` reaproveitado, correto como está |
+| Divergência real PT→ES, `canonical_name_es` adicionado | 14 | Ver tabela abaixo |
+
+| Ativo (asset_id) | PT (canonical_name) | ES (canonical_name_es) |
+|---|---|---|
+| AT-009 | Chá Verde | Té Verde |
+| AT-010 | Semente de Uva | Semilla de Uva |
+| AT-011 | Romã | Granada |
+| AT-017 | Calendula | Caléndula |
+| AT-018 | Camomila | Manzanilla |
+| AT-019 | Alcaçuz | Regaliz |
+| AT-022 | Figo da Índia | Higo Chumbo |
+| AT-023 | Esqualano Vegetal | Escualano Vegetal |
+| AT-025 | Aveia Coloidal | Avena Coloidal |
+| AT-026 | Arbutin | Arbutina |
+| AT-028 | Margarida | Margarita |
+| AT-029 | Cânhamo / CBD | Cáñamo / CBD |
+| AT-033 | Ácido Tranexâmico | Ácido Tranexámico |
+| AT-034 | Ácido Lactobiônico | Ácido Lactobiónico |
+
+Casos mantidos deliberadamente sem tradução (nomes internacionais/trade
+names já usados como estão em literatura cosmética em espanhol, ou
+binomiais latinos sem vernáculo único-padrão confiável): Bakuchiol,
+Bidens Pilosa, Edelweiss, Ginkgo Biloba, Jambu, Kakadu Plum, Pycnogenol,
+Boswellia, Tremella, Rosa Damascena, Camu-Camu, Aloe Vera, Rosa Mosqueta,
+Café Verde, Fitoceramidas de Trigo (nenhum destes teve uma tradução real
+identificada com confiança suficiente para registrar sem risco de
+introduzir um erro — preferível manter o termo internacional a arriscar
+uma tradução errada).
+
+PT-BR e PT-PT continuam compartilhando o mesmo `canonical_name` — nenhuma
+divergência de nomenclatura entre as duas variantes de português foi
+identificada nos 35 ativos deste catálogo.
+
+### 2 pontos menores confirmados nesta auditoria
+
+- **Rodapé ES sem sufixo de país:** confirmado e corrigido -
+  `reports/pdf_generator.py` TRANSLATIONS["ES"]["footer"] agora termina em
+  "(España)", no mesmo padrão de "(Brasil)"/"(Portugal)" já usado em
+  PT-BR/PT-PT.
+- **Categoria "Disruptive Dark Horses" ausente da legenda:** investigado e
+  **não é uma omissão** — a legenda (`methodology_html`, dentro de
+  `<div class="methodology-box">`) sempre lista as 3 categorias possíveis,
+  independente de haver alguma linha com aquele badge na tabela naquela
+  edição; confirmado inspecionando os 3 HTMLs gerados (badge `cat-darkhorse`
+  presente nos 3, mais a nota "Nenhum ativo qualificado nesta categoria..."
+  citando "Sinal Científico sem Confirmação Industrial" pelo nome, já que
+  nenhum ativo qualificou genuinamente para Dark Horse nesta execução - ver
+  seção "Preenchimento fabricado removido" acima). Nenhuma alteração feita.
+
+**Teste de regressão:** `tests/test_es_localization_regression.py` (4
+testes) - trava os 3 achados especificamente: rótulo "Limitações:"
+localizado por idioma, toda `source` regulatória com tradução ES real
+(não uma cópia do PT-BR), a taxonomia com os 3 nomes ES corretos
+(Alcaçuz→Regaliz, Calendula→Caléndula, Ácido Tranexâmico→Ácido
+Tranexámico), e um teste de integração que gera um relatório ES completo
+(dados sintéticos, sem chamada de rede/LLM) e escaneia o HTML final por um
+blocklist de strings português-only. Verificado manualmente contra o
+código anterior a esta correção (`git show HEAD:...`): os testes que
+dependem de `localize_source()`/`canonical_name_es`/`lang_key` falham lá
+(função inexistente, campo ausente, `TypeError` de assinatura),
+confirmando que são regressões genuínas.
+
 ## 5. Confiança do Sinal
 
 **Onde:** `core/score_engine.py` → `calculate_confidence_level()`

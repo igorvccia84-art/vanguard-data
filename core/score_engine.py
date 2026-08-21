@@ -106,6 +106,45 @@ class ScoreEngine:
     o Risco de Oferta final expõe qual dos dois o determinou.
     """
 
+    @staticmethod
+    def _verified_pubmed_matches(pubmed_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Filtro único de 'match verificado' (entity_match confirmado) - usado por calculate_scientific_traction_breakdown() e por extract_verified_pmids(), para as duas nunca divergirem sobre o que conta como evidência real."""
+        return [m for m in pubmed_matches if isinstance(m, dict) and m.get("entity_match")]
+
+    def extract_verified_pmids(self, pubmed_matches: List[Dict[str, Any]]) -> List[str]:
+        """
+        PMIDs de `pubmed_matches` (janela de tração de 12 meses, ver
+        connectors.pubmed.PubMedConnector TRACTION_WINDOW_DAYS) que
+        efetivamente entram na fórmula de T_c - exatamente o mesmo filtro
+        usado internamente por calculate_scientific_traction_breakdown()
+        (`_verified_pubmed_matches`), nunca reimplementado em separado.
+
+        CORRIGIDO (2026-08-20, achado de auditoria): main.py citava no
+        relatório final só os PMIDs de uma busca de "novidade" de 15 dias
+        (connectors.pubmed.PubMedConnector.search_articles() sem `days=`),
+        uma janela DIFERENTE da que efetivamente calcula T_c - um ativo podia
+        ter evidência real e verificada por trás do score (ex.: Calendula/
+        AT-017, ver docs/calculation_trace_calendula_2026-08-19.md) e o
+        relatório ainda assim declarar "nenhuma evidência disponível", porque
+        a janela de 15 dias não tinha capturado os mesmos artigos. Exposto
+        aqui para main.py citar como evidência do CÁLCULO em si, não apenas
+        de novidade recente.
+        """
+        return [m["pmid"] for m in self._verified_pubmed_matches(pubmed_matches) if m.get("pmid")]
+
+    @staticmethod
+    def extract_traction_patent_ids(patent_matches: List[Dict[str, Any]]) -> List[str]:
+        """
+        IDs de patente de `patent_matches` (janela de tração de 12 meses) que
+        efetivamente entram na fórmula de T_i - toda a lista, sem filtro
+        adicional de entity_match (calculate_industrial_traction() usa
+        `len(patent_matches)` diretamente; `patent_matches` já chega aqui
+        filtrado pela validação real via Google Patents, ver main.py
+        `valid_traction_patent_ids`). Mesmo motivo/uso de extract_verified_pmids()
+        acima - expõe a evidência real do cálculo para citação no relatório.
+        """
+        return [p["patent_id"] for p in patent_matches if isinstance(p, dict) and p.get("patent_id")]
+
     def calculate_scientific_traction_breakdown(
         self,
         pubmed_matches: List[Dict[str, Any]],
@@ -139,7 +178,7 @@ class ScoreEngine:
         (generate_assessment() persiste o breakdown completo). Pesos
         provisórios - ver PROVISIONAL_WEIGHTS_DISCLAIMER.
         """
-        resolved = [m for m in pubmed_matches if isinstance(m, dict) and m.get("entity_match")]
+        resolved = self._verified_pubmed_matches(pubmed_matches)
         verified_count = len(resolved)
 
         weights = {"V": W_SCI_VOLUME, "G": W_SCI_GROWTH, "A": W_SCI_APPLICABILITY, "Q": W_SCI_QUALITY}

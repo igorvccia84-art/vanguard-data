@@ -2,7 +2,7 @@ import sys
 import io
 import re
 import hashlib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 from core.entity_resolver import EntityResolver
 from connectors.trade_eurostat import TradeEurostatConnector
@@ -349,22 +349,286 @@ class RegulatoryRegistryTraceabilityError(ValueError):
 _LAST_VERIFIED_DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 
+# Tradução de 'source' por idioma do relatório - CORRIGIDO (2026-08-20):
+# 'source' é armazenado em PT-BR (idioma mestre) dentro de REGULATORY_REGISTRY/
+# EU_REGULATORY_OVERRIDES/FDA_REGULATORY_OVERRIDES, mas é exposto DIRETO no
+# PDF (evidence-tag "REG: ...", reports/pdf_generator.py) sem passar pela LLM
+# (ao contrário de 'alerts', que só chega ao leitor via texto já traduzido
+# pela síntese da LLM) - por isso nunca era traduzido, e vazava em português
+# até para o relatório ES (achado de auditoria: os 3 ativos High-Risk do
+# relatório ES mostravam o disclaimer REG inteiro em português).
+#
+# Chaveado pelo texto EXATO em PT-BR (o valor 'source' de cada entrada) - só
+# 10 strings distintas existem nas 49 entradas das 3 bases (muita reutilização
+# de template), então esta tabela cobre a base inteira sem precisar
+# triplicar cada entrada num dict aninhado por idioma. PT-PT não precisa de
+# tradução própria aqui: o texto-fonte já está em português, que é o idioma
+# de PT-PT também - a checagem que importa para PT-PT é de CONTEÚDO (citar
+# um instrumento legal brasileiro como "RDC" num relatório de Portugal), não
+# de IDIOMA; registrado como observação separada em METHODOLOGY.md, não
+# corrigido aqui (fora do escopo desta rodada - é sobre proveniência da
+# citação, não sobre tradução).
+#
+# Validado na importação do módulo (_validate_regulatory_registries()
+# abaixo): toda 'source' distinta usada nas 3 bases PRECISA ter uma entrada
+# "ES" aqui, ou a importação falha - mesmo princípio de "nunca falhar em
+# silêncio" já aplicado a source/last_verified.
+SOURCE_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "Sem RDC/resolução específica citada nesta base - classificação por avaliação interna da equipe de regulatório, não vinculada a um dispositivo legal auditável nesta entrada.": {
+        "ES": "Sin RDC/resolución específica citada en esta base - clasificación por evaluación interna del equipo de regulación, no vinculada a un dispositivo legal auditable en esta entrada."
+    },
+    "Regulamento (UE) 2019/831 (citado nesta entrada da base Anvisa por proximidade de regra - inconsistência de proveniência pré-existente, ver METHODOLOGY.md)": {
+        "ES": "Reglamento (UE) 2019/831 (citado en esta entrada de la base Anvisa por proximidad de regla - inconsistencia de procedencia preexistente, ver METHODOLOGY.md)"
+    },
+    "Regulamento (CE) 1223/2009 (sem limite numérico de ácido glicirrízico - controlado via rotulagem de alérgenos, sem entrada de Anexo específica citada)": {
+        "ES": "Reglamento (CE) 1223/2009 (sin límite numérico de ácido glicirrízico - controlado mediante etiquetado de alérgenos, sin entrada de Anexo específica citada)"
+    },
+    "Regulamento (CE) 1223/2009, Anexo III, entrada 77 (Alpha-Arbutin)": {
+        "ES": "Reglamento (CE) 1223/2009, Anexo III, entrada 77 (Alfa-Arbutina)"
+    },
+    "Regulamento (CE) 1223/2009, Anexo II (extratos de folha/flor de Cannabis sativa); avaliação ECHA caso a caso para derivados de semente": {
+        "ES": "Reglamento (CE) 1223/2009, Anexo II (extractos de hoja/flor de Cannabis sativa); evaluación ECHA caso por caso para derivados de semilla"
+    },
+    "Regulamento (CE) 1223/2009, Anexo III (sem entrada numérica específica citada nesta base)": {
+        "ES": "Reglamento (CE) 1223/2009, Anexo III (sin entrada numérica específica citada en esta base)"
+    },
+    "Regulamento (UE) 2019/831, Anexo III, entrada 98": {
+        "ES": "Reglamento (UE) 2019/831, Anexo III, entrada 98"
+    },
+    "Regulamento (CE) 1223/2009 (sem entrada específica no CosIng identificada para uso tópico cosmético desta categoria)": {
+        "ES": "Reglamento (CE) 1223/2009 (sin entrada específica en CosIng identificada para uso tópico cosmético de esta categoría)"
+    },
+    "Regulamento (CE) 1223/2009 (delimitação de escopo cosmético vs. produto medicinal, sem entrada de Anexo específica citada)": {
+        "ES": "Reglamento (CE) 1223/2009 (delimitación de alcance cosmético vs. producto medicinal, sin entrada de Anexo específica citada)"
+    },
+    "Sem citação de CFR/monografia OTC específica nesta base - avaliação interna qualitativa da postura da FDA para cosméticos (que não exige aprovação prévia sob o FD&C Act), não vinculada a um número de CFR auditável nesta entrada.": {
+        "ES": "Sin cita de CFR/monografía OTC específica en esta base - evaluación interna cualitativa de la postura de la FDA para cosméticos (que no exige aprobación previa bajo la FD&C Act), no vinculada a un número de CFR auditable en esta entrada."
+    },
+}
+
+
+def localize_source(source_pt: str, lang: str) -> str:
+    """
+    Traduz um valor 'source' (armazenado em PT-BR nas 3 bases regulatórias)
+    para o idioma do relatório. PT-BR/PT-PT retornam o texto como está (já
+    em português). ES busca em SOURCE_TRANSLATIONS - se o texto exato não
+    estiver cadastrado lá (ex.: 'source' novo adicionado sem tradução),
+    retorna o PT-BR original com um prefixo de alerta visível em vez de
+    falhar silenciosamente ou expor texto em português sem aviso nenhum
+    (fail-loud também em tempo de renderização, não só na importação do
+    módulo).
+    """
+    lang_key = lang.upper()
+    if lang_key != "ES":
+        return source_pt
+    translations = SOURCE_TRANSLATIONS.get(source_pt)
+    if not translations or "ES" not in translations:
+        return f"[TRADUÇÃO ES AUSENTE] {source_pt}"
+    return translations["ES"]
+
+
+# Tradução de 'alerts' (lista de avisos regulatórios em texto livre, armazenada
+# em PT-BR em REGULATORY_REGISTRY/EU_REGULATORY_OVERRIDES) por idioma - CORRIGIDO
+# (2026-08-20, achado de auditoria: vazamento de vocabulário técnico em
+# português na prosa gerada pela LLM para o relatório ES). Diferente de
+# 'source' (só exposto no PDF via evidence-tag REG, para ativos High-Risk),
+# 'alerts' é injetado no PROMPT de core/llm_analysis.py generate_recommendations
+# (campo 'Alertas regulatórios específicos desta jurisdição') para TODO ativo
+# com ao menos um alerta, em qualquer categoria de triagem - por isso o
+# vazamento aparecia mesmo em ativos fora de High-Risk. FDA_REGULATORY_OVERRIDES
+# não precisa de entrada aqui: seus 'alerts' nunca chegam ao prompt da LLM nem
+# ao PDF (main.py só repassa a jurisdição ANVISA/EU_1223_2009 para o dossiê
+# regional consultado pela LLM; FDA entra apenas no cálculo de severidade
+# cross-jurisdição de get_regulatory_matrix(), como valor numérico).
+#
+# Chaveado pelo texto EXATO em PT-BR de cada alerta individual (não a lista
+# inteira) - validado na importação do módulo (_validate_regulatory_registries()),
+# mesmo princípio de "nunca falhar em silêncio" já aplicado a source/last_verified.
+ALERT_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "Requer dossiê de segurança complementar": {
+        "ES": "Requiere dossier de seguridad complementario"
+    },
+    "Limite de concentração por potencial irritante (spilanthol)": {
+        "ES": "Límite de concentración por potencial irritante (espilantol)"
+    },
+    "Monitoramento de pureza da resina": {
+        "ES": "Monitoreo de pureza de la resina"
+    },
+    "Limite regulatório de ácido glicirrízico (Anvisa/EU)": {
+        "ES": "Límite regulatorio de ácido glicirrícico (Anvisa/UE)"
+    },
+    "Rotulagem obrigatória de alérgeno (derivado de trigo)": {
+        "ES": "Etiquetado obligatorio de alérgeno (derivado de trigo)"
+    },
+    "Precursor de hidroquinona - escrutínio regulatório elevado (clareadores)": {
+        "ES": "Precursor de hidroquinona - escrutinio regulatorio elevado (blanqueadores)"
+    },
+    "Derivado de Cannabis sativa - barreiras regulatórias de importação/registro": {
+        "ES": "Derivado de Cannabis sativa - barreras regulatorias de importación/registro"
+    },
+    "Uso profissional acima de 10% restrito a procedimentos de peeling": {
+        "ES": "Uso profesional por encima del 10% restringido a procedimientos de peeling"
+    },
+    "Proibido em produtos leave-on para menores de 3 anos (EU 2019/831)": {
+        "ES": "Prohibido en productos leave-on para menores de 3 años (UE 2019/831)"
+    },
+    "Sem monografia tópica consolidada na Anvisa - uso off-label em skincare": {
+        "ES": "Sin monografía tópica consolidada en Anvisa - uso off-label en skincare"
+    },
+    "Acima de 10% classificado como uso dermatológico/prescrição em alguns mercados": {
+        "ES": "Por encima del 10% clasificado como uso dermatológico/con receta en algunos mercados"
+    },
+    "Sem limite numérico de ácido glicirrízico no Regulamento (CE) 1223/2009 - controlado via rotulagem de alérgenos": {
+        "ES": "Sin límite numérico de ácido glicirrícico en el Reglamento (CE) 1223/2009 - controlado mediante etiquetado de alérgenos"
+    },
+    "Alpha-Arbutin listado no Anexo III, entrada 77, do Regulamento (CE) 1223/2009": {
+        "ES": "Alfa-Arbutina listada en el Anexo III, entrada 77, del Reglamento (CE) 1223/2009"
+    },
+    "Extratos de folha/flor de Cannabis sativa restritos no Anexo II; derivados de semente (óleo/CBD de cânhamo industrial) avaliados caso a caso pela ECHA": {
+        "ES": "Extractos de hoja/flor de Cannabis sativa restringidos en el Anexo II; derivados de semilla (aceite/CBD de cáñamo industrial) evaluados caso por caso por la ECHA"
+    },
+    "Proibido em produtos leave-on para menores de 3 anos - Regulamento (UE) 2019/831, Anexo III entrada 98": {
+        "ES": "Prohibido en productos leave-on para menores de 3 años - Reglamento (UE) 2019/831, Anexo III entrada 98"
+    },
+    "Sem entrada específica no CosIng para uso tópico cosmético - uso off-label": {
+        "ES": "Sin entrada específica en CosIng para uso tópico cosmético - uso off-label"
+    },
+    "Concentrações mais altas (uso dermatológico) tratadas como produto medicinal, fora do escopo do Regulamento (CE) 1223/2009": {
+        "ES": "Concentraciones más altas (uso dermatológico) tratadas como producto medicinal, fuera del alcance del Reglamento (CE) 1223/2009"
+    },
+    "Ativo não mapeado na base regulatória local": {
+        "ES": "Activo no mapeado en la base regulatoria local"
+    },
+}
+
+# Tradução de 'max_concentration_allowed' por idioma - só as entradas que
+# carregam anotação textual em PT (não os valores puramente numéricos/"N/A",
+# que já são neutros entre os idiomas). Mesmo motivo/mecanismo de vazamento
+# de ALERT_TRANSLATIONS acima: o valor é injetado direto no prompt da LLM.
+MAX_CONCENTRATION_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "N/A (rotulagem obrigatória)": {
+        "ES": "N/A (etiquetado obligatorio)"
+    },
+    "2.0% (creme facial) / 0.5% (loção corporal)": {
+        "ES": "2.0% (crema facial) / 0.5% (loción corporal)"
+    },
+    "pH ≥ 3.5 (sem teto percentual fixo no Anexo III para uso profissional)": {
+        "ES": "pH ≥ 3.5 (sin techo porcentual fijo en el Anexo III para uso profesional)"
+    },
+}
+
+# Tradução ES dos 3 pequenos vocabulários fechados (status/restriction_level/
+# trend) usados nos dossiês regulatório e comercial - PT-BR/PT-PT continuam
+# recebendo o valor canônico original (sem mudança de comportamento para
+# esses 2 idiomas), só ES recebe um rótulo traduzido antes de entrar no
+# prompt da LLM (mesmo mecanismo de vazamento das tabelas acima).
+STATUS_LABEL_ES = {
+    "APROVADO_USO_TOPICO": "Aprobado para uso tópico",
+    "USO_RESTRITO": "Uso restringido",
+    "EM_ANALISE": "En análisis",
+    "FALHA_CONSULTA": "Fallo en la consulta",
+}
+RESTRICTION_LEVEL_LABEL_ES = {
+    "NENHUM": "Ninguno",
+    "BAIXO": "Bajo",
+    "MEDIO": "Medio",
+    "ALTO": "Alto",
+    "DESCONHECIDO": "Desconocido",
+}
+TREND_LABEL_ES = {
+    "CRESCENTE": "Creciente",
+    "ESTAVEL": "Estable",
+    "DECRESCENTE": "Decreciente",
+    "NEUTRO": "Neutro",
+}
+
+
+def localize_alerts(alerts: Optional[List[str]], lang: str) -> List[str]:
+    """
+    Traduz cada alerta da lista (armazenados em PT-BR) para o idioma do
+    relatório antes de entrar no prompt da LLM. PT-BR/PT-PT retornam a lista
+    como está. ES busca em ALERT_TRANSLATIONS por alerta individual - se um
+    alerta específico não estiver cadastrado lá, retorna o PT-BR original com
+    um prefixo de alerta visível (fail-loud também em tempo de execução, não
+    só na importação do módulo).
+    """
+    if not alerts:
+        return []
+    lang_key = lang.upper()
+    if lang_key != "ES":
+        return list(alerts)
+    localized = []
+    for alert_pt in alerts:
+        translations = ALERT_TRANSLATIONS.get(alert_pt)
+        if not translations or "ES" not in translations:
+            localized.append(f"[TRADUÇÃO ES AUSENTE] {alert_pt}")
+        else:
+            localized.append(translations["ES"])
+    return localized
+
+
+def localize_max_concentration(value: Optional[str], lang: str) -> Optional[str]:
+    """Traduz 'max_concentration_allowed' (quando carrega anotação textual em PT) para o idioma do relatório."""
+    lang_key = lang.upper()
+    if lang_key != "ES" or not value:
+        return value
+    translations = MAX_CONCENTRATION_TRANSLATIONS.get(value)
+    return translations["ES"] if translations and "ES" in translations else value
+
+
+def localize_status(value: Optional[str], lang: str) -> Optional[str]:
+    """Traduz o status regulatório canônico (ex.: 'APROVADO_USO_TOPICO') para o idioma do relatório."""
+    lang_key = lang.upper()
+    if lang_key != "ES" or not value:
+        return value
+    return STATUS_LABEL_ES.get(value, value)
+
+
+def localize_restriction_level(value: Optional[str], lang: str) -> Optional[str]:
+    """Traduz o nível de restrição canônico (ex.: 'ALTO') para o idioma do relatório."""
+    lang_key = lang.upper()
+    if lang_key != "ES" or not value:
+        return value
+    return RESTRICTION_LEVEL_LABEL_ES.get(value, value)
+
+
+def localize_trend(value: Optional[str], lang: str) -> Optional[str]:
+    """Traduz a tendência comercial canônica (ex.: 'CRESCENTE') para o idioma do relatório."""
+    lang_key = lang.upper()
+    if lang_key != "ES" or not value:
+        return value
+    return TREND_LABEL_ES.get(value, value)
+
+
 def _validate_regulatory_registries() -> None:
     """
     Falha explicitamente (levanta RegulatoryRegistryTraceabilityError) se
     QUALQUER entrada das 3 bases regulatórias estiver sem 'source' (string
     não vazia - citando a norma/resolução que embasa a entrada, ou
-    declarando explicitamente a ausência de uma citação específica) ou sem
+    declarando explicitamente a ausência de uma citação específica), sem
     'last_verified' (string YYYY-MM-DD válida - data da última confirmação
-    manual de que a entrada ainda reflete a regulação vigente). Chamada uma
-    vez na importação do módulo - uma entrada nova adicionada sem os dois
-    campos derruba a importação do pacote inteiro, não passa despercebida.
+    manual de que a entrada ainda reflete a regulação vigente), se o
+    'source' da entrada não tiver uma tradução ES registrada em
+    SOURCE_TRANSLATIONS (CORRIGIDO 2026-08-20 - achado de auditoria: o
+    disclaimer REG vazava em português no relatório ES), ou se algum alerta
+    de REGULATORY_REGISTRY/EU_REGULATORY_OVERRIDES não tiver tradução ES
+    registrada em ALERT_TRANSLATIONS (CORRIGIDO 2026-08-20 - achado de
+    auditoria: vazamento de vocabulário técnico em português na PROSA gerada
+    pela LLM, via 'alerts' injetado no prompt de generate_recommendations;
+    FDA_REGULATORY_OVERRIDES fica de fora desta checagem porque seus
+    'alerts' nunca chegam ao prompt da LLM nem ao PDF, ver ALERT_TRANSLATIONS
+    acima). Chamada uma vez na importação do módulo - uma entrada nova
+    adicionada sem esses requisitos derruba a importação do pacote inteiro,
+    não passa despercebida.
     """
     registries = (
         ("REGULATORY_REGISTRY", RegulatoryComexConnector.REGULATORY_REGISTRY),
         ("EU_REGULATORY_OVERRIDES", RegulatoryComexConnector.EU_REGULATORY_OVERRIDES),
         ("FDA_REGULATORY_OVERRIDES", RegulatoryComexConnector.FDA_REGULATORY_OVERRIDES),
     )
+    # Só as 2 bases cujos 'alerts' realmente chegam ao prompt da LLM (ver
+    # docstring acima) - FDA_REGULATORY_OVERRIDES não participa desta checagem.
+    registries_requiring_alert_translation = {"REGULATORY_REGISTRY", "EU_REGULATORY_OVERRIDES"}
     for registry_name, registry in registries:
         for asset_id, entry in registry.items():
             source = entry.get("source")
@@ -381,6 +645,23 @@ def _validate_regulatory_registries() -> None:
                     "YYYY-MM-DD) - toda entrada precisa registrar a data da última confirmação manual de "
                     "que ainda reflete a regulação vigente."
                 )
+            if source not in SOURCE_TRANSLATIONS or "ES" not in SOURCE_TRANSLATIONS[source]:
+                raise RegulatoryRegistryTraceabilityError(
+                    f"{registry_name}['{asset_id}'] tem 'source' sem tradução ES registrada em "
+                    f"SOURCE_TRANSLATIONS - toda 'source' distinta usada nas 3 bases precisa de uma "
+                    f"tradução ES antes de entrar em produção, para não vazar texto em português no "
+                    f"relatório espanhol. Texto sem tradução: {source!r}"
+                )
+            if registry_name in registries_requiring_alert_translation:
+                for alert in entry.get("alerts") or []:
+                    if alert not in ALERT_TRANSLATIONS or "ES" not in ALERT_TRANSLATIONS[alert]:
+                        raise RegulatoryRegistryTraceabilityError(
+                            f"{registry_name}['{asset_id}'] tem um alerta sem tradução ES registrada em "
+                            f"ALERT_TRANSLATIONS - todo alerta distinto usado nestas bases precisa de uma "
+                            f"tradução ES antes de entrar em produção, para não vazar vocabulário técnico "
+                            f"em português na prosa gerada pela LLM para o relatório espanhol. "
+                            f"Texto sem tradução: {alert!r}"
+                        )
 
 
 _validate_regulatory_registries()

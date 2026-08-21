@@ -10,6 +10,8 @@ from core.predictive_ranking import (
     MIN_SCI_FOR_EMERGING_STAR, MIN_IND_FOR_EMERGING_STAR,
     CATEGORY_HIGH_RISK, CATEGORY_EMERGING_STARS, CATEGORY_DARK_HORSES,
 )
+from connectors.regulatory_comex import localize_source
+from connectors.patents import PatentConnector
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -25,6 +27,18 @@ SCHEMA_VERSION = "2.0.0"
 MODEL_VERSION = "2.0.0"
 BRAND_NAME = "Actives Predict"
 SEARCH_WINDOW_DAYS = 15  # deve casar com connectors/pubmed.py e connectors/patents.py
+
+# Template de URL da página pública do artigo no NCBI PubMed, para o link
+# clicável do PMID nas evidence-tags do relatório - CORRIGIDO (2026-08-20,
+# achado de auditoria: PMIDs/patentes usados no cálculo de T_c/T_i não
+# apareciam no relatório - ver o comentário longo em main.py, "PubMed
+# (Tração)", para a causa raiz da regressão). Sem constante equivalente em
+# connectors/pubmed.py (só há BASE_URL da API E-utilities, não da página
+# pública do artigo), por isso definida aqui. O template de patente reaproveita
+# connectors.patents.PatentConnector.GOOGLE_PATENTS_URL - a mesma URL já usada
+# ao vivo por validate_patent_batch() para confirmar a patente antes dela
+# entrar no relatório, nunca uma URL redigitada à parte.
+PMID_URL_TEMPLATE = "https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
 
 # Autoridade regulatória e fonte de dados comerciais/comex padrão por idioma do
 # relatório, usadas quando o chamador não injeta explicitamente o dossiê da
@@ -337,7 +351,7 @@ class PDFReportGenerator:
             "col_evidence_pmid": "PMID",
             "col_evidence_pat": "PAT",
             "col_evidence_reg": "REG",
-            "footer": "Informe generado automáticamente por la Plataforma Actives Predict",
+            "footer": "Informe generado automáticamente por la Plataforma Actives Predict (España)",
             "audit_title": "Período de Análisis y Fuentes de Datos",
             "audit_run_id": "ID de Ejecución (Run ID)",
             "audit_processed_at": "Fecha/Hora de Procesamiento",
@@ -525,9 +539,19 @@ class PDFReportGenerator:
             inovacao_pd = _scrub_unverified_identifiers(inovacao_pd, asset_pmids, asset_patent_ids)
             compras_procurement = _scrub_unverified_identifiers(compras_procurement, asset_pmids, asset_patent_ids)
 
-            evidence_tags = "".join(f'<span class="evidence-tag">{t["col_evidence_pmid"]}: {p}</span>' for p in item.get("pmids", []) or [])
+            # Links clicáveis para a fonte pública de cada PMID/patente - NCBI PubMed
+            # e Google Patents (mesma URL usada ao vivo pela validação determinística
+            # pré-relatório, ver PMID_URL_TEMPLATE acima). target="_blank" só tem efeito
+            # na visualização do HTML no navegador (irrelevante para o PDF, que abre o
+            # link no visualizador padrão do sistema).
+            evidence_tags = "".join(
+                f'<span class="evidence-tag">{t["col_evidence_pmid"]}: '
+                f'<a href="{PMID_URL_TEMPLATE.format(pmid=p)}" target="_blank">{p}</a></span>'
+                for p in item.get("pmids", []) or []
+            )
             evidence_tags += "".join(
-                f'<span class="evidence-tag">{t["col_evidence_pat"]}: {self._format_patent_id(p)}</span>'
+                f'<span class="evidence-tag">{t["col_evidence_pat"]}: '
+                f'<a href="{PatentConnector.GOOGLE_PATENTS_URL.format(patent_id=p)}" target="_blank">{self._format_patent_id(p)}</a></span>'
                 for p in item.get("patent_ids", []) or []
             )
             # Rastreabilidade regulatória (obrigatória em toda entrada de
@@ -535,10 +559,14 @@ class PDFReportGenerator:
             # exposta como evidence-tag - só para ativos cuja categoria de
             # triagem é de fato "High-Risk / Supply Alert", para não poluir
             # toda linha da tabela com uma fonte regulatória que não influenciou
-            # a categorização daquele ativo.
+            # a categorização daquele ativo. localize_source() traduz para ES
+            # (armazenado em PT-BR na base - CORRIGIDO 2026-08-20, achado de
+            # auditoria: vazava em português no relatório espanhol); PT-BR/PT-PT
+            # recebem o texto como está.
             if item.get("predictive_category") == CATEGORY_HIGH_RISK and item.get("regulatory_source"):
                 verified = item.get("regulatory_last_verified") or "N/A"
-                evidence_tags += f'<span class="evidence-tag">{t["col_evidence_reg"]}: {item["regulatory_source"]} ({t["regulatory_verified_on"]} {verified})</span>'
+                localized_source = localize_source(item["regulatory_source"], lang)
+                evidence_tags += f'<span class="evidence-tag">{t["col_evidence_reg"]}: {localized_source} ({t["regulatory_verified_on"]} {verified})</span>'
             evidence_html = f'<div class="evidence-refs">{evidence_tags}</div>' if evidence_tags else ""
 
             recommendation_rows_html += f"""
@@ -723,6 +751,10 @@ class PDFReportGenerator:
             opacity: 0.9;
             word-break: break-all;
             line-height: 1.35;
+        }}
+        .evidence-tag a {{
+            color: {COLOR_GOLD_PALE};
+            text-decoration: underline;
         }}
         .methodology-box {{
             border: 1px solid #e2e8f0;
